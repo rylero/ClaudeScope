@@ -89,6 +89,13 @@ Returns: `[{"start":<µs>,"end":<µs>},...]`
 ```bash
 MSYS_NO_PATHCONV=1 ClaudeScope find-threshold /RealOutputs/PowerDistribution/Voltage --min 10.0 --max 11.5 --session <id>
 ```
+`--min` and `--max` are each optional — supply just one for a one-sided test (at least one is required):
+```bash
+# voltage below 11.0
+MSYS_NO_PATHCONV=1 ClaudeScope find-threshold /RealOutputs/PowerDistribution/Voltage --max 11.0 --session <id>
+# current above 40
+MSYS_NO_PATHCONV=1 ClaudeScope find-threshold /RealOutputs/PowerDistribution/Current --min 40.0 --session <id>
+```
 Returns: `[{"start":<µs>,"end":<µs>},...]`
 
 ### Statistics for a numeric field
