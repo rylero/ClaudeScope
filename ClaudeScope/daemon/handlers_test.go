@@ -134,6 +134,29 @@ func TestHandleInfo_Success(t *testing.T) {
 	}
 }
 
+func TestHandleSessions(t *testing.T) {
+	reg := &Registry{entries: make(map[string]*entry)}
+	reg.AddLabeled(&mockSession{}, "/logs/match.wpilog")
+	handler := HandleSessions(reg)
+
+	req := httptest.NewRequest(http.MethodGet, "/sessions", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp struct {
+		Sessions []SessionInfo `json:"sessions"`
+	}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if len(resp.Sessions) != 1 {
+		t.Fatalf("expected 1 session, got %d", len(resp.Sessions))
+	}
+	if resp.Sessions[0].Label != "/logs/match.wpilog" {
+		t.Errorf("expected label, got %q", resp.Sessions[0].Label)
+	}
+}
+
 func TestHandleSet_OnLogSession_ReturnsError(t *testing.T) {
 	reg, id, _ := testRegistry(t)
 	handler := HandleSet(reg)

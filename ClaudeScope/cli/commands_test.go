@@ -55,6 +55,23 @@ func TestRunCommand_Disconnect(t *testing.T) {
 	}
 }
 
+func TestRunCommand_Sessions(t *testing.T) {
+	serveFake(t, map[string]any{
+		"/sessions": map[string]any{"sessions": []map[string]any{
+			{"id": "abc", "type": "log", "label": "/logs/a.wpilog", "idle_seconds": 3},
+		}},
+	})
+	out, err := RunCommand([]string{"sessions"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp map[string]any
+	json.Unmarshal(out, &resp)
+	if resp["sessions"] == nil {
+		t.Error("expected sessions in response")
+	}
+}
+
 func TestRunCommand_Info(t *testing.T) {
 	serveFake(t, map[string]any{
 		"/info": map[string]any{"fields": []map[string]string{{"key": "/voltage", "type": "double"}}, "start": 0, "end": 3000},

@@ -107,6 +107,13 @@ func HandlePing(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
+// HandleSessions lists all active sessions.
+func HandleSessions(reg *Registry) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, map[string]any{"sessions": reg.List()})
+	}
+}
+
 // HandleConnect starts a live NT session.
 func HandleConnect(reg *Registry, factory NTSessionFactory) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +128,7 @@ func HandleConnect(reg *Registry, factory NTSessionFactory) http.HandlerFunc {
 				fmt.Sprintf("connect failed: %v", err), "CONNECT_FAILED")
 			return
 		}
-		id := reg.Add(sess)
+		id := reg.AddLabeled(sess, req.IP)
 		writeJSON(w, connectResponse{SessionID: id})
 	}
 }
@@ -146,7 +153,7 @@ func HandleLoad(reg *Registry) http.HandlerFunc {
 				fmt.Sprintf("invalid wpilog: %v", err), "INVALID_LOG")
 			return
 		}
-		id := reg.Add(sess)
+		id := reg.AddLabeled(sess, req.Path)
 		fields, _ := sess.Fields()
 		writeJSON(w, map[string]any{"session_id": id, "fields": fields})
 	}

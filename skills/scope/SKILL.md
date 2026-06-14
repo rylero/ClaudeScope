@@ -60,6 +60,13 @@ Returns: `{"session_id":"<id>"}`
 ClaudeScope disconnect --session <id>
 ```
 
+### List active sessions
+```bash
+ClaudeScope sessions
+```
+Returns: `{"sessions":[{"id":"<id>","type":"log|live","label":"<path-or-ip>","idle_seconds":<n>},...]}`
+Use this to recover a session ID if you lost it (e.g. after context compaction) instead of re-loading the log.
+
 ### List fields and time range
 ```bash
 ClaudeScope info --session <id>
