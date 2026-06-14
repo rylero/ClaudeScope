@@ -15,6 +15,12 @@ import (
 const sessionTTL = 10 * time.Minute
 const sweepInterval = 60 * time.Second
 
+// SessionInfo is metadata about one active session.
+type SessionInfo struct {
+	ID          string `json:"id"`
+	Type        string `json:"type"`  // "log" or "live"
+	Label       string `json:"label"` // file path or robot ip
+	IdleSeconds int64  `json:"idle_seconds"`
 // ErrNoSession indicates no active sessions exist to default to.
 var ErrNoSession = errors.New("no active session; run 'load <file>' or 'connect <ip>' first")
 
@@ -28,6 +34,7 @@ func (e *AmbiguousSessionError) Error() string {
 
 type entry struct {
 	sess     session.DataSession
+	label    string
 	lastUsed time.Time
 }
 
@@ -46,13 +53,41 @@ func NewRegistry() *Registry {
 
 // Add registers sess and returns its new session ID.
 func (r *Registry) Add(sess session.DataSession) string {
+	return r.AddLabeled(sess, "")
+}
+
+// AddLabeled registers sess with a human-readable label (file path or robot IP)
+// and returns its new session ID. The label is reported by List.
+func (r *Registry) AddLabeled(sess session.DataSession, label string) string {
 	id := newID()
 	r.mu.Lock()
-	r.entries[id] = &entry{sess: sess, lastUsed: time.Now()}
+	r.entries[id] = &entry{sess: sess, label: label, lastUsed: time.Now()}
 	r.mu.Unlock()
 	return id
 }
 
+// List returns metadata for all active sessions, sorted by ID.
+func (r *Registry) List() []SessionInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]SessionInfo, 0, len(r.entries))
+	for id, e := range r.entries {
+		out = append(out, SessionInfo{
+			ID:          id,
+			Type:        typeString(e.sess.Type()),
+			Label:       e.label,
+			IdleSeconds: int64(time.Since(e.lastUsed).Seconds()),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func typeString(t session.SessionType) string {
+	if t == session.LiveSession {
+		return "live"
+	}
+	return "log"
 // Resolve returns the session for id. If id is empty, it returns the sole
 // active session; it returns ErrNoSession if none exist or an
 // *AmbiguousSessionError if more than one does. The resolved ID is returned so

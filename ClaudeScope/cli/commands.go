@@ -24,6 +24,8 @@ func RunCommand(args []string) ([]byte, error) {
 		return runLoad(args[1:])
 	case "disconnect":
 		return runDisconnect(args[1:])
+	case "sessions":
+		return runSessions(args[1:])
 	case "info":
 		return runInfo(args[1:])
 	case "get":
@@ -101,6 +103,10 @@ func runDisconnect(args []string) ([]byte, error) {
 	_, flags := parseFlags(args)
 	id := flags["session"]
 	return DoRequest(http.MethodPost, "/disconnect", map[string]string{"session_id": id})
+}
+
+func runSessions(_ []string) ([]byte, error) {
+	return DoRequest(http.MethodGet, "/sessions", nil)
 }
 
 func runInfo(args []string) ([]byte, error) {
@@ -259,6 +265,13 @@ func runHelp() ([]byte, error) {
 				Usage:   "ClaudeScope disconnect --session <id>",
 				Params:  []param{{Name: "--session", Type: "string", Required: false, Desc: "Session ID from load/connect; optional when exactly one session is active"}},
 				Returns: `{}`,
+			},
+			{
+				Name:    "sessions",
+				Desc:    "List all active sessions (useful to recover a session ID after losing it).",
+				Usage:   "ClaudeScope sessions",
+				Params:  []param{},
+				Returns: `{"sessions":[{"id":"<id>","type":"log|live","label":"<path-or-ip>","idle_seconds":<n>},...]}`,
 			},
 			{
 				Name:    "info",

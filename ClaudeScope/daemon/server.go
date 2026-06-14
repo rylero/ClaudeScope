@@ -11,6 +11,7 @@ const DaemonAddr = "localhost:5812"
 func NewServer(reg *Registry, factory NTSessionFactory) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /ping", HandlePing)
+	mux.HandleFunc("GET /sessions", HandleSessions(reg))
 	mux.HandleFunc("POST /connect", HandleConnect(reg, factory))
 	mux.HandleFunc("POST /load", HandleLoad(reg))
 	mux.HandleFunc("POST /disconnect", HandleDisconnect(reg))

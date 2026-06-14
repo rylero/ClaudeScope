@@ -165,6 +165,41 @@ func TestRegistry_Touch_ResetsExpiry(t *testing.T) {
 	}
 }
 
+func TestRegistry_List(t *testing.T) {
+	r := NewRegistry()
+	idA := r.AddLabeled(&mockSession{}, "/logs/a.wpilog")
+	idB := r.AddLabeled(&mockSession{}, "/logs/b.wpilog")
+
+	list := r.List()
+	if len(list) != 2 {
+		t.Fatalf("expected 2 sessions, got %d", len(list))
+	}
+	// List is sorted by ID; build a lookup to assert per-session fields.
+	byID := map[string]SessionInfo{}
+	for _, s := range list {
+		byID[s.ID] = s
+	}
+	if byID[idA].Label != "/logs/a.wpilog" {
+		t.Errorf("expected label for A, got %q", byID[idA].Label)
+	}
+	if byID[idB].Type != "log" {
+		t.Errorf("expected type 'log', got %q", byID[idB].Type)
+	}
+}
+
+func TestRegistry_List_SortedByID(t *testing.T) {
+	r := NewRegistry()
+	for i := 0; i < 5; i++ {
+		r.Add(&mockSession{})
+	}
+	list := r.List()
+	for i := 1; i < len(list); i++ {
+		if list[i-1].ID > list[i].ID {
+			t.Fatalf("List not sorted by ID: %q before %q", list[i-1].ID, list[i].ID)
+		}
+	}
+}
+
 func TestRegistry_UniqueIDs(t *testing.T) {
 	r := NewRegistry()
 	ids := map[string]struct{}{}
