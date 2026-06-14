@@ -61,14 +61,6 @@ func parseFlags(args []string) (positional []string, flags map[string]string) {
 	return
 }
 
-func requireSession(flags map[string]string) (string, error) {
-	id, ok := flags["session"]
-	if !ok || id == "" {
-		return "", fmt.Errorf("--session <id> is required")
-	}
-	return id, nil
-}
-
 func flagInt64(flags map[string]string, key string, defaultVal int64) int64 {
 	s, ok := flags[key]
 	if !ok {
@@ -107,19 +99,13 @@ func runLoad(args []string) ([]byte, error) {
 
 func runDisconnect(args []string) ([]byte, error) {
 	_, flags := parseFlags(args)
-	id, err := requireSession(flags)
-	if err != nil {
-		return nil, err
-	}
+	id := flags["session"]
 	return DoRequest(http.MethodPost, "/disconnect", map[string]string{"session_id": id})
 }
 
 func runInfo(args []string) ([]byte, error) {
 	_, flags := parseFlags(args)
-	id, err := requireSession(flags)
-	if err != nil {
-		return nil, err
-	}
+	id := flags["session"]
 	return DoRequest(http.MethodGet, "/info?session="+id, nil)
 }
 
@@ -128,10 +114,7 @@ func runGet(args []string) ([]byte, error) {
 	if len(pos) < 1 {
 		return nil, fmt.Errorf("usage: get <key> [key2 ...] --session <id> [--time <us>]")
 	}
-	id, err := requireSession(flags)
-	if err != nil {
-		return nil, err
-	}
+	id := flags["session"]
 	return DoRequest(http.MethodPost, "/get", map[string]any{
 		"session_id": id,
 		"keys":       pos,
@@ -144,10 +127,7 @@ func runRange(args []string) ([]byte, error) {
 	if len(pos) < 1 {
 		return nil, fmt.Errorf("usage: range <key> [key2 ...] --session <id> [--start <us>] [--end <us>]")
 	}
-	id, err := requireSession(flags)
-	if err != nil {
-		return nil, err
-	}
+	id := flags["session"]
 	return DoRequest(http.MethodPost, "/range", map[string]any{
 		"session_id": id,
 		"keys":       pos,
@@ -161,10 +141,7 @@ func runFindBool(args []string) ([]byte, error) {
 	if len(pos) < 2 {
 		return nil, fmt.Errorf("usage: find-bool <key> <true|false> --session <id>")
 	}
-	id, err := requireSession(flags)
-	if err != nil {
-		return nil, err
-	}
+	id := flags["session"]
 	return DoRequest(http.MethodPost, "/find-bool", map[string]any{
 		"session_id": id,
 		"key":        pos[0],
@@ -213,10 +190,7 @@ func runStats(args []string) ([]byte, error) {
 	if len(pos) < 1 {
 		return nil, fmt.Errorf("usage: stats <key> --session <id> [--start <us>] [--end <us>]")
 	}
-	id, err := requireSession(flags)
-	if err != nil {
-		return nil, err
-	}
+	id := flags["session"]
 	return DoRequest(http.MethodPost, "/stats", map[string]any{
 		"session_id": id,
 		"key":        pos[0],
@@ -260,7 +234,9 @@ func runHelp() ([]byte, error) {
 			"end=0 means end of log.",
 			"time=0 in get means latest value.",
 			"On Git Bash/MSYS2, set MSYS_NO_PATHCONV=1 before keys that start with '/'.",
-			"Workflow: load → get session_id → query with --session → disconnect when done.",
+			"--session is optional when exactly one session is active; it defaults to that session. With multiple sessions, an AMBIGUOUS_SESSION error lists the IDs.",
+			"Global flag: append --out <file> to any command to write its output to a file instead of stdout.",
+			"Workflow: load → query (--session optional) → disconnect when done.",
 		},
 		Commands: []cmd{
 			{
@@ -281,14 +257,14 @@ func runHelp() ([]byte, error) {
 				Name:    "disconnect",
 				Desc:    "Close a session and free resources.",
 				Usage:   "ClaudeScope disconnect --session <id>",
-				Params:  []param{{Name: "--session", Type: "string", Required: true, Desc: "Session ID from load/connect"}},
+				Params:  []param{{Name: "--session", Type: "string", Required: false, Desc: "Session ID from load/connect; optional when exactly one session is active"}},
 				Returns: `{}`,
 			},
 			{
 				Name:    "info",
 				Desc:    "List all fields and time range for a session.",
 				Usage:   "ClaudeScope info --session <id>",
-				Params:  []param{{Name: "--session", Type: "string", Required: true, Desc: "Session ID"}},
+				Params:  []param{{Name: "--session", Type: "string", Required: false, Desc: "Session ID; optional when exactly one session is active"}},
 				Returns: `{"fields":[{"key":"...","type":"..."}],"start":<us>,"end":<us>}`,
 			},
 			{
@@ -297,7 +273,7 @@ func runHelp() ([]byte, error) {
 				Usage: "ClaudeScope get <key> [key2 ...] --session <id> [--time <us>]",
 				Params: []param{
 					{Name: "keys", Type: "[]string", Required: true, Desc: "One or more field keys (positional)"},
-					{Name: "--session", Type: "string", Required: true, Desc: "Session ID"},
+					{Name: "--session", Type: "string", Required: false, Desc: "Session ID; optional when exactly one session is active"},
 					{Name: "--time", Type: "int64", Required: false, Desc: "Timestamp µs; 0=latest"},
 				},
 				Returns: `{"<key>":{"timestamp":<us>,"value":<any>},...}`,
@@ -308,7 +284,7 @@ func runHelp() ([]byte, error) {
 				Usage: "ClaudeScope range <key> [key2 ...] --session <id> [--start <us>] [--end <us>]",
 				Params: []param{
 					{Name: "keys", Type: "[]string", Required: true, Desc: "One or more field keys"},
-					{Name: "--session", Type: "string", Required: true, Desc: "Session ID"},
+					{Name: "--session", Type: "string", Required: false, Desc: "Session ID; optional when exactly one session is active"},
 					{Name: "--start", Type: "int64", Required: false, Desc: "Start µs; 0=beginning; negative=offset from end"},
 					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log; negative=offset from end"},
 				},
@@ -321,7 +297,7 @@ func runHelp() ([]byte, error) {
 				Params: []param{
 					{Name: "key", Type: "string", Required: true, Desc: "Boolean field key"},
 					{Name: "value", Type: "bool", Required: true, Desc: "true or false"},
-					{Name: "--session", Type: "string", Required: true, Desc: "Session ID"},
+					{Name: "--session", Type: "string", Required: false, Desc: "Session ID; optional when exactly one session is active"},
 				},
 				Returns: `[{"start":<us>,"end":<us>},...]`,
 			},
@@ -343,7 +319,7 @@ func runHelp() ([]byte, error) {
 				Usage: "ClaudeScope stats <key> --session <id> [--start <us>] [--end <us>]",
 				Params: []param{
 					{Name: "key", Type: "string", Required: true, Desc: "Numeric field key"},
-					{Name: "--session", Type: "string", Required: true, Desc: "Session ID"},
+					{Name: "--session", Type: "string", Required: false, Desc: "Session ID; optional when exactly one session is active"},
 					{Name: "--start", Type: "int64", Required: false, Desc: "Start µs; 0=beginning"},
 					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log"},
 				},
@@ -355,7 +331,7 @@ func runHelp() ([]byte, error) {
 				Usage: "ClaudeScope set <key>=<val> [key2=val2 ...] --session <id>",
 				Params: []param{
 					{Name: "pairs", Type: "[]string", Required: true, Desc: "key=value pairs; value auto-parsed as float, bool, or string"},
-					{Name: "--session", Type: "string", Required: true, Desc: "Session ID (must be a live session)"},
+					{Name: "--session", Type: "string", Required: false, Desc: "Session ID (must be a live session); optional when exactly one session is active"},
 				},
 				Returns: `{}`,
 			},
@@ -375,10 +351,7 @@ func runSet(args []string) ([]byte, error) {
 	if len(pos) < 1 {
 		return nil, fmt.Errorf("usage: set <key>=<val> [key2=val2 ...] --session <id>")
 	}
-	id, err := requireSession(flags)
-	if err != nil {
-		return nil, err
-	}
+	id := flags["session"]
 	pairs := make(map[string]any, len(pos))
 	for _, kv := range pos {
 		idx := strings.Index(kv, "=")

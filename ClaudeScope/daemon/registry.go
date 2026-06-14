@@ -2,7 +2,10 @@ package daemon
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,6 +14,17 @@ import (
 
 const sessionTTL = 10 * time.Minute
 const sweepInterval = 60 * time.Second
+
+// ErrNoSession indicates no active sessions exist to default to.
+var ErrNoSession = errors.New("no active session; run 'load <file>' or 'connect <ip>' first")
+
+// AmbiguousSessionError is returned when a default session cannot be chosen
+// because more than one session is active. It lists the candidate IDs.
+type AmbiguousSessionError struct{ IDs []string }
+
+func (e *AmbiguousSessionError) Error() string {
+	return fmt.Sprintf("multiple active sessions (%s); specify --session <id>", strings.Join(e.IDs, ", "))
+}
 
 type entry struct {
 	sess     session.DataSession
@@ -37,6 +51,34 @@ func (r *Registry) Add(sess session.DataSession) string {
 	r.entries[id] = &entry{sess: sess, lastUsed: time.Now()}
 	r.mu.Unlock()
 	return id
+}
+
+// Resolve returns the session for id. If id is empty, it returns the sole
+// active session; it returns ErrNoSession if none exist or an
+// *AmbiguousSessionError if more than one does. The resolved ID is returned so
+// callers (e.g. disconnect) can act on the concrete session.
+func (r *Registry) Resolve(id string) (session.DataSession, string, error) {
+	if id != "" {
+		s, err := r.Get(id)
+		return s, id, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch len(r.entries) {
+	case 0:
+		return nil, "", ErrNoSession
+	case 1:
+		for k, e := range r.entries {
+			e.lastUsed = time.Now()
+			return e.sess, k, nil
+		}
+	}
+	ids := make([]string, 0, len(r.entries))
+	for k := range r.entries {
+		ids = append(ids, k)
+	}
+	sort.Strings(ids)
+	return nil, "", &AmbiguousSessionError{IDs: ids}
 }
 
 // Get returns the session for id, refreshing its last-used time.

@@ -55,6 +55,54 @@ func TestRegistry_Get_NotFound(t *testing.T) {
 	}
 }
 
+func TestRegistry_Resolve_Explicit(t *testing.T) {
+	r := NewRegistry()
+	s := &mockSession{}
+	id := r.Add(s)
+	got, gotID, err := r.Resolve(id)
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if got != s || gotID != id {
+		t.Fatal("Resolve returned wrong session/id for explicit lookup")
+	}
+}
+
+func TestRegistry_Resolve_DefaultSingle(t *testing.T) {
+	r := NewRegistry()
+	s := &mockSession{}
+	id := r.Add(s)
+	got, gotID, err := r.Resolve("")
+	if err != nil {
+		t.Fatalf("expected default resolution, got error: %v", err)
+	}
+	if got != s || gotID != id {
+		t.Fatal("Resolve(\"\") should return the sole session")
+	}
+}
+
+func TestRegistry_Resolve_NoSession(t *testing.T) {
+	r := NewRegistry()
+	_, _, err := r.Resolve("")
+	if !errors.Is(err, ErrNoSession) {
+		t.Fatalf("expected ErrNoSession, got %v", err)
+	}
+}
+
+func TestRegistry_Resolve_Ambiguous(t *testing.T) {
+	r := NewRegistry()
+	r.Add(&mockSession{})
+	r.Add(&mockSession{})
+	_, _, err := r.Resolve("")
+	var amb *AmbiguousSessionError
+	if !errors.As(err, &amb) {
+		t.Fatalf("expected AmbiguousSessionError, got %v", err)
+	}
+	if len(amb.IDs) != 2 {
+		t.Errorf("expected 2 candidate IDs, got %d", len(amb.IDs))
+	}
+}
+
 func TestRegistry_Remove(t *testing.T) {
 	r := NewRegistry()
 	s := &mockSession{}

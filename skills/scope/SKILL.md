@@ -28,12 +28,13 @@ Verify: `ClaudeScope version`
 
 ```
 1. Load the log (or connect to NT) → get session_id
-2. Run queries using --session <id>
+2. Run queries (--session is optional with one session open)
 3. Disconnect when done
 ```
 
 ## Critical Notes
 
+- **Default session**: `--session` is optional when exactly one session is active — every command defaults to it, so you usually don't need to thread the ID through. With zero sessions you get a `NO_SESSION` error; with multiple, an `AMBIGUOUS_SESSION` error listing the IDs (pass `--session <id>` to pick one, or run `sessions` to see them).
 - **Git Bash path issue**: Keys starting with `/` get mangled by MSYS2. Always prefix commands with `MSYS_NO_PATHCONV=1`.
 - **Timestamps** are microseconds (µs) since log start.
 - **Negative start/end** = offset from end of log. `-5000000` = last 5 seconds.
