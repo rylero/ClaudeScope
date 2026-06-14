@@ -83,10 +83,22 @@ func TestRunCommand_Get(t *testing.T) {
 	}
 }
 
-func TestRunCommand_MissingSession(t *testing.T) {
-	_, err := RunCommand([]string{"get", "/voltage"})
-	if err == nil {
-		t.Fatal("expected error for missing --session flag")
+func TestRunCommand_OmittedSession(t *testing.T) {
+	// --session is now optional at the CLI; the daemon resolves a default.
+	// The CLI should forward the request with an empty session_id, not error.
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		json.NewEncoder(w).Encode(map[string]any{"/voltage": map[string]any{"timestamp": 0, "value": 12.0}})
+	}))
+	t.Cleanup(srv.Close)
+	patchAddr(t, srv.URL)
+
+	if _, err := RunCommand([]string{"get", "/voltage"}); err != nil {
+		t.Fatalf("omitting --session should not error at the CLI: %v", err)
+	}
+	if got["session_id"] != "" {
+		t.Errorf("expected empty session_id forwarded, got %v", got["session_id"])
 	}
 }
 
