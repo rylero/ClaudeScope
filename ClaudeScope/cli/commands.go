@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -174,19 +175,30 @@ func runFindBool(args []string) ([]byte, error) {
 func runFindThreshold(args []string) ([]byte, error) {
 	pos, flags := parseFlags(args)
 	if len(pos) < 1 {
-		return nil, fmt.Errorf("usage: find-threshold <key> --min <n> --max <n> --session <id>")
+		return nil, fmt.Errorf("usage: find-threshold <key> [--min <n>] [--max <n>] --session <id>")
 	}
 	id, err := requireSession(flags)
 	if err != nil {
 		return nil, err
 	}
-	minVal, err := flagFloat64(flags, "min")
-	if err != nil {
-		return nil, err
+	_, hasMin := flags["min"]
+	_, hasMax := flags["max"]
+	if !hasMin && !hasMax {
+		return nil, fmt.Errorf("find-threshold requires at least one of --min or --max")
 	}
-	maxVal, err := flagFloat64(flags, "max")
-	if err != nil {
-		return nil, err
+	// Unbounded sides default to ±max float so the daemon's min <= v <= max
+	// comparison degenerates to a one-sided test.
+	minVal := -math.MaxFloat64
+	maxVal := math.MaxFloat64
+	if hasMin {
+		if minVal, err = flagFloat64(flags, "min"); err != nil {
+			return nil, err
+		}
+	}
+	if hasMax {
+		if maxVal, err = flagFloat64(flags, "max"); err != nil {
+			return nil, err
+		}
 	}
 	return DoRequest(http.MethodPost, "/find-threshold", map[string]any{
 		"session_id": id,
@@ -315,12 +327,12 @@ func runHelp() ([]byte, error) {
 			},
 			{
 				Name:  "find-threshold",
-				Desc:  "Find all time ranges where a numeric field is within [min, max].",
-				Usage: "ClaudeScope find-threshold <key> --min <n> --max <n> --session <id>",
+				Desc:  "Find all time ranges where a numeric field is within [min, max]. At least one bound is required; omit one for a one-sided test.",
+				Usage: "ClaudeScope find-threshold <key> [--min <n>] [--max <n>] --session <id>",
 				Params: []param{
 					{Name: "key", Type: "string", Required: true, Desc: "Numeric field key"},
-					{Name: "--min", Type: "float64", Required: true, Desc: "Lower bound (inclusive)"},
-					{Name: "--max", Type: "float64", Required: true, Desc: "Upper bound (inclusive)"},
+					{Name: "--min", Type: "float64", Required: false, Desc: "Lower bound (inclusive); omit for no lower bound"},
+					{Name: "--max", Type: "float64", Required: false, Desc: "Upper bound (inclusive); omit for no upper bound"},
 					{Name: "--session", Type: "string", Required: true, Desc: "Session ID"},
 				},
 				Returns: `[{"start":<us>,"end":<us>},...]`,

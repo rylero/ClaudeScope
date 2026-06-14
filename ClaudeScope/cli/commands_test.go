@@ -136,6 +136,35 @@ func TestRunCommand_FindThreshold(t *testing.T) {
 	}
 }
 
+func TestRunCommand_FindThreshold_OneSided(t *testing.T) {
+	// Capture the request body so we can assert the unbounded side is filled in.
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		json.NewEncoder(w).Encode([]map[string]any{{"start": 0, "end": 1000}})
+	}))
+	t.Cleanup(srv.Close)
+	patchAddr(t, srv.URL)
+
+	// Only --max: min should default to a large negative bound.
+	if _, err := RunCommand([]string{"find-threshold", "/voltage", "--max", "11.0", "--session", "abc"}); err != nil {
+		t.Fatal(err)
+	}
+	if got["min"].(float64) >= 0 {
+		t.Errorf("expected large-negative default min, got %v", got["min"])
+	}
+	if got["max"].(float64) != 11.0 {
+		t.Errorf("expected max 11.0, got %v", got["max"])
+	}
+}
+
+func TestRunCommand_FindThreshold_NoBounds(t *testing.T) {
+	_, err := RunCommand([]string{"find-threshold", "/voltage", "--session", "abc"})
+	if err == nil {
+		t.Fatal("expected error when neither --min nor --max is given")
+	}
+}
+
 func TestRunCommand_Set(t *testing.T) {
 	serveFake(t, map[string]any{"/set": struct{}{}})
 	_, err := RunCommand([]string{"set", "/key=1.0", "--session", "abc"})
