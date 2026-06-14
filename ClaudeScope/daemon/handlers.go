@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -100,6 +101,26 @@ func sessionNotFound(w http.ResponseWriter, id string) {
 		fmt.Sprintf("session not found: %s", id), "SESSION_NOT_FOUND")
 }
 
+// resolveSession looks up a session, applying default-session resolution when
+// id is empty. On failure it writes the appropriate error response and returns
+// ok=false. On success it returns the session and its concrete ID.
+func resolveSession(reg *Registry, w http.ResponseWriter, id string) (session.DataSession, string, bool) {
+	sess, resolvedID, err := reg.Resolve(id)
+	if err != nil {
+		var amb *AmbiguousSessionError
+		switch {
+		case errors.Is(err, ErrNoSession):
+			writeError(w, http.StatusNotFound, err.Error(), "NO_SESSION")
+		case errors.As(err, &amb):
+			writeError(w, http.StatusBadRequest, err.Error(), "AMBIGUOUS_SESSION")
+		default:
+			sessionNotFound(w, id)
+		}
+		return nil, "", false
+	}
+	return sess, resolvedID, true
+}
+
 // --- handlers ---
 
 // HandlePing responds 200 OK so the CLI can detect a running daemon.
@@ -167,8 +188,12 @@ func HandleDisconnect(reg *Registry) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid JSON", "BAD_REQUEST")
 			return
 		}
-		if err := reg.Remove(req.SessionID); err != nil {
-			sessionNotFound(w, req.SessionID)
+		_, resolvedID, ok := resolveSession(reg, w, req.SessionID)
+		if !ok {
+			return
+		}
+		if err := reg.Remove(resolvedID); err != nil {
+			sessionNotFound(w, resolvedID)
 			return
 		}
 		writeJSON(w, struct{}{})
@@ -179,9 +204,8 @@ func HandleDisconnect(reg *Registry) http.HandlerFunc {
 func HandleInfo(reg *Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("session")
-		sess, err := reg.Get(id)
-		if err != nil {
-			sessionNotFound(w, id)
+		sess, _, ok := resolveSession(reg, w, id)
+		if !ok {
 			return
 		}
 		fields, err := sess.Fields()
@@ -210,9 +234,8 @@ func HandleGet(reg *Registry) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid JSON", "BAD_REQUEST")
 			return
 		}
-		sess, err := reg.Get(req.SessionID)
-		if err != nil {
-			sessionNotFound(w, req.SessionID)
+		sess, _, ok := resolveSession(reg, w, req.SessionID)
+		if !ok {
 			return
 		}
 		result, err := sess.GetValues(req.Keys, req.Time)
@@ -232,9 +255,8 @@ func HandleRange(reg *Registry) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid JSON", "BAD_REQUEST")
 			return
 		}
-		sess, err := reg.Get(req.SessionID)
-		if err != nil {
-			sessionNotFound(w, req.SessionID)
+		sess, _, ok := resolveSession(reg, w, req.SessionID)
+		if !ok {
 			return
 		}
 		result, err := sess.GetRanges(req.Keys, req.Start, req.End)
@@ -254,9 +276,8 @@ func HandleFindBool(reg *Registry) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid JSON", "BAD_REQUEST")
 			return
 		}
-		sess, err := reg.Get(req.SessionID)
-		if err != nil {
-			sessionNotFound(w, req.SessionID)
+		sess, _, ok := resolveSession(reg, w, req.SessionID)
+		if !ok {
 			return
 		}
 		ranges, err := sess.FindBoolRanges(req.Key, req.Value)
@@ -276,9 +297,8 @@ func HandleFindThreshold(reg *Registry) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid JSON", "BAD_REQUEST")
 			return
 		}
-		sess, err := reg.Get(req.SessionID)
-		if err != nil {
-			sessionNotFound(w, req.SessionID)
+		sess, _, ok := resolveSession(reg, w, req.SessionID)
+		if !ok {
 			return
 		}
 		ranges, err := sess.FindThresholdRanges(req.Key, req.Min, req.Max)
@@ -298,9 +318,8 @@ func HandleStats(reg *Registry) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid JSON", "BAD_REQUEST")
 			return
 		}
-		sess, err := reg.Get(req.SessionID)
-		if err != nil {
-			sessionNotFound(w, req.SessionID)
+		sess, _, ok := resolveSession(reg, w, req.SessionID)
+		if !ok {
 			return
 		}
 		stats, err := sess.Stats(req.Key, req.Start, req.End)
@@ -320,9 +339,8 @@ func HandleSet(reg *Registry) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid JSON", "BAD_REQUEST")
 			return
 		}
-		sess, err := reg.Get(req.SessionID)
-		if err != nil {
-			sessionNotFound(w, req.SessionID)
+		sess, _, ok := resolveSession(reg, w, req.SessionID)
+		if !ok {
 			return
 		}
 		if err := sess.Set(req.Pairs); err != nil {

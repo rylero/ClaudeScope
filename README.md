@@ -16,6 +16,7 @@ Install the plugin to get all skills in Claude Code:
 **Included skills:**
 - `/scope` — Analyze `.wpilog` files and query live NetworkTables via ClaudeScope
 - `/simulate` — Launch robot simulation, connect ClaudeScope, and run a goal-driven investigation headlessly
+- `/replay` — Re-run a real or sim `.wpilog` through the robot code in AdvantageKit replay mode, then compare recorded vs. recomputed outputs with ClaudeScope
 
 ## ClaudeScope
 

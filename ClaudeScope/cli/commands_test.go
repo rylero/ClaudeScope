@@ -100,10 +100,22 @@ func TestRunCommand_Get(t *testing.T) {
 	}
 }
 
-func TestRunCommand_MissingSession(t *testing.T) {
-	_, err := RunCommand([]string{"get", "/voltage"})
-	if err == nil {
-		t.Fatal("expected error for missing --session flag")
+func TestRunCommand_OmittedSession(t *testing.T) {
+	// --session is now optional at the CLI; the daemon resolves a default.
+	// The CLI should forward the request with an empty session_id, not error.
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		json.NewEncoder(w).Encode(map[string]any{"/voltage": map[string]any{"timestamp": 0, "value": 12.0}})
+	}))
+	t.Cleanup(srv.Close)
+	patchAddr(t, srv.URL)
+
+	if _, err := RunCommand([]string{"get", "/voltage"}); err != nil {
+		t.Fatalf("omitting --session should not error at the CLI: %v", err)
+	}
+	if got["session_id"] != "" {
+		t.Errorf("expected empty session_id forwarded, got %v", got["session_id"])
 	}
 }
 
@@ -150,6 +162,35 @@ func TestRunCommand_FindThreshold(t *testing.T) {
 	json.Unmarshal(out, &resp)
 	if len(resp) != 1 {
 		t.Errorf("expected 1 range, got %d", len(resp))
+	}
+}
+
+func TestRunCommand_FindThreshold_OneSided(t *testing.T) {
+	// Capture the request body so we can assert the unbounded side is filled in.
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		json.NewEncoder(w).Encode([]map[string]any{{"start": 0, "end": 1000}})
+	}))
+	t.Cleanup(srv.Close)
+	patchAddr(t, srv.URL)
+
+	// Only --max: min should default to a large negative bound.
+	if _, err := RunCommand([]string{"find-threshold", "/voltage", "--max", "11.0", "--session", "abc"}); err != nil {
+		t.Fatal(err)
+	}
+	if got["min"].(float64) >= 0 {
+		t.Errorf("expected large-negative default min, got %v", got["min"])
+	}
+	if got["max"].(float64) != 11.0 {
+		t.Errorf("expected max 11.0, got %v", got["max"])
+	}
+}
+
+func TestRunCommand_FindThreshold_NoBounds(t *testing.T) {
+	_, err := RunCommand([]string{"find-threshold", "/voltage", "--session", "abc"})
+	if err == nil {
+		t.Fatal("expected error when neither --min nor --max is given")
 	}
 }
 

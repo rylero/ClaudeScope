@@ -134,26 +134,43 @@ func TestHandleInfo_Success(t *testing.T) {
 	}
 }
 
-func TestHandleSessions(t *testing.T) {
-	reg := &Registry{entries: make(map[string]*entry)}
-	reg.AddLabeled(&mockSession{}, "/logs/match.wpilog")
-	handler := HandleSessions(reg)
-
-	req := httptest.NewRequest(http.MethodGet, "/sessions", nil)
-	w := httptest.NewRecorder()
-	handler(w, req)
+func TestHandleGet_DefaultSession(t *testing.T) {
+	reg, _, _ := testRegistry(t) // one session under a fixed ID
+	handler := HandleGet(reg)
+	// Omit session_id entirely — should resolve to the sole session.
+	w := postJSON(t, handler, map[string]any{"keys": []string{"/k"}})
 	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
+		t.Fatalf("expected 200 via default session, got %d: %s", w.Code, w.Body)
 	}
-	var resp struct {
-		Sessions []SessionInfo `json:"sessions"`
+}
+
+func TestHandleGet_NoSession(t *testing.T) {
+	reg := &Registry{entries: make(map[string]*entry)}
+	handler := HandleGet(reg)
+	w := postJSON(t, handler, map[string]any{"keys": []string{"/k"}})
+	if w.Code == http.StatusOK {
+		t.Fatal("expected error with no active sessions")
 	}
-	json.NewDecoder(w.Body).Decode(&resp)
-	if len(resp.Sessions) != 1 {
-		t.Fatalf("expected 1 session, got %d", len(resp.Sessions))
+	var errResp errorResponse
+	json.NewDecoder(w.Body).Decode(&errResp)
+	if errResp.Code != "NO_SESSION" {
+		t.Errorf("expected NO_SESSION, got %q", errResp.Code)
 	}
-	if resp.Sessions[0].Label != "/logs/match.wpilog" {
-		t.Errorf("expected label, got %q", resp.Sessions[0].Label)
+}
+
+func TestHandleGet_AmbiguousSession(t *testing.T) {
+	reg := &Registry{entries: make(map[string]*entry)}
+	reg.Add(&mockSession{})
+	reg.Add(&mockSession{})
+	handler := HandleGet(reg)
+	w := postJSON(t, handler, map[string]any{"keys": []string{"/k"}})
+	if w.Code == http.StatusOK {
+		t.Fatal("expected error with multiple active sessions")
+	}
+	var errResp errorResponse
+	json.NewDecoder(w.Body).Decode(&errResp)
+	if errResp.Code != "AMBIGUOUS_SESSION" {
+		t.Errorf("expected AMBIGUOUS_SESSION, got %q", errResp.Code)
 	}
 }
 
