@@ -21,6 +21,8 @@ type SessionInfo struct {
 	Type        string `json:"type"`  // "log" or "live"
 	Label       string `json:"label"` // file path or robot ip
 	IdleSeconds int64  `json:"idle_seconds"`
+}
+
 // ErrNoSession indicates no active sessions exist to default to.
 var ErrNoSession = errors.New("no active session; run 'load <file>' or 'connect <ip>' first")
 
@@ -88,6 +90,8 @@ func typeString(t session.SessionType) string {
 		return "live"
 	}
 	return "log"
+}
+
 // Resolve returns the session for id. If id is empty, it returns the sole
 // active session; it returns ErrNoSession if none exist or an
 // *AmbiguousSessionError if more than one does. The resolved ID is returned so

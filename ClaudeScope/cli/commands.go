@@ -160,10 +160,8 @@ func runFindThreshold(args []string) ([]byte, error) {
 	if len(pos) < 1 {
 		return nil, fmt.Errorf("usage: find-threshold <key> [--min <n>] [--max <n>] --session <id>")
 	}
-	id, err := requireSession(flags)
-	if err != nil {
-		return nil, err
-	}
+	id := flags["session"]
+	var err error
 	_, hasMin := flags["min"]
 	_, hasMax := flags["max"]
 	if !hasMin && !hasMax {
