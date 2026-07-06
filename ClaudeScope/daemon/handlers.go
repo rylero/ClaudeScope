@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/rylero/TheFRCSuite/ClaudeScope/query"
 	"github.com/rylero/TheFRCSuite/ClaudeScope/session"
 )
 
@@ -77,6 +78,13 @@ type statsRequest struct {
 type setRequest struct {
 	SessionID string         `json:"session_id"`
 	Pairs     map[string]any `json:"pairs"`
+}
+
+type queryRequest struct {
+	SessionID string `json:"session_id"`
+	Query     string `json:"query"`
+	Start     int64  `json:"start"`
+	End       int64  `json:"end"`
 }
 
 // --- helpers ---
@@ -328,6 +336,27 @@ func HandleStats(reg *Registry) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, stats)
+	}
+}
+
+// HandleQuery runs a pipe query (see the `query` package) against a session.
+func HandleQuery(reg *Registry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req queryRequest
+		if err := decodeBody(r, &req); err != nil || req.Query == "" {
+			writeError(w, http.StatusBadRequest, "missing query field", "BAD_REQUEST")
+			return
+		}
+		sess, _, ok := resolveSession(reg, w, req.SessionID)
+		if !ok {
+			return
+		}
+		result, err := query.Run(sess, req.Query, req.Start, req.End)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "QUERY_ERROR")
+			return
+		}
+		writeJSON(w, map[string]any{"result": result})
 	}
 }
 

@@ -38,6 +38,8 @@ func RunCommand(args []string) ([]byte, error) {
 		return runFindThreshold(args[1:])
 	case "stats":
 		return runStats(args[1:])
+	case "query":
+		return runQuery(args[1:])
 	case "set":
 		return runSet(args[1:])
 	case "help":
@@ -203,6 +205,20 @@ func runStats(args []string) ([]byte, error) {
 	})
 }
 
+func runQuery(args []string) ([]byte, error) {
+	pos, flags := parseFlags(args)
+	if len(pos) < 1 {
+		return nil, fmt.Errorf(`usage: query "<pipe string>" --session <id> [--start <us>] [--end <us>]`)
+	}
+	id := flags["session"]
+	return DoRequest(http.MethodPost, "/query", map[string]any{
+		"session_id": id,
+		"query":      pos[0],
+		"start":      flagInt64(flags, "start", 0),
+		"end":        flagInt64(flags, "end", 0),
+	})
+}
+
 func runVersion() ([]byte, error) {
 	return json.Marshal(map[string]string{"version": Version})
 }
@@ -222,10 +238,10 @@ func runHelp() ([]byte, error) {
 		Returns string  `json:"returns"`
 	}
 	type schema struct {
-		Tool     string `json:"tool"`
-		Version  string `json:"version"`
+		Tool     string   `json:"tool"`
+		Version  string   `json:"version"`
 		Notes    []string `json:"notes"`
-		Commands []cmd  `json:"commands"`
+		Commands []cmd    `json:"commands"`
 	}
 
 	s := schema{
@@ -335,6 +351,18 @@ func runHelp() ([]byte, error) {
 					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log"},
 				},
 				Returns: `{"mean":<f>,"median":<f>,"min":<f>,"max":<f>,"q1":<f>,"q3":<f>,"avg_delta":<f/s>,"min_delta":<f/s>,"max_delta":<f/s>}`,
+			},
+			{
+				Name:  "query",
+				Desc:  "Run a Splunk-style pipe query (where/stats/table/sort/head/tail/ranges) joining multiple fields on a shared, forward-filled timestamp axis.",
+				Usage: `ClaudeScope query "<pipe string>" --session <id> [--start <us>] [--end <us>]`,
+				Params: []param{
+					{Name: "query", Type: "string", Required: true, Desc: `Pipe query, e.g. "where CurrentA > 40 and CurrentB > 40 | stats avg(BatteryVoltage) by Subsystem"`},
+					{Name: "--session", Type: "string", Required: false, Desc: "Session ID; optional when exactly one session is active"},
+					{Name: "--start", Type: "int64", Required: false, Desc: "Start µs; 0=beginning; negative=offset from end"},
+					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log; negative=offset from end"},
+				},
+				Returns: `{"result":[{"Timestamp":<us>,"<field>":<value>,...},...]} or {"result":[{"start":<us>,"end":<us>},...]} when the pipeline ends in 'ranges'`,
 			},
 			{
 				Name:  "set",

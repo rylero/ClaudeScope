@@ -1,0 +1,43 @@
+name: ClaudeScope CI
+
+on:
+  pull_request:
+    paths:
+      - "ClaudeScope/**"
+      - ".github/workflows/claudescope-ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "ClaudeScope/**"
+      - ".github/workflows/claudescope-ci.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ClaudeScope
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ClaudeScope/go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: gofmt check
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt'd:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: Test
+        run: go test ./... -race

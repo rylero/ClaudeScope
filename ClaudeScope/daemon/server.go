@@ -22,6 +22,7 @@ func NewServer(reg *Registry, factory NTSessionFactory) *http.ServeMux {
 	mux.HandleFunc("POST /find-threshold", HandleFindThreshold(reg))
 	mux.HandleFunc("POST /stats", HandleStats(reg))
 	mux.HandleFunc("POST /set", HandleSet(reg))
+	mux.HandleFunc("POST /query", HandleQuery(reg))
 	return mux
 }
 
