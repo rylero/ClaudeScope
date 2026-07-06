@@ -13,7 +13,16 @@ type Pipeline struct {
 
 // Parse compiles a pipe query string into a Pipeline, e.g.
 // `where CurrentA > 40 and CurrentB > 40 | stats avg(BatteryVoltage) by Subsystem`.
+// Any “ `macro` “ backtick-references are expanded first (see LoadMacros).
 func Parse(input string) (*Pipeline, error) {
+	macros, err := LoadMacros()
+	if err != nil {
+		return nil, err
+	}
+	input, err = expandMacros(input, macros)
+	if err != nil {
+		return nil, err
+	}
 	toks, err := lex(input)
 	if err != nil {
 		return nil, err
@@ -87,6 +96,8 @@ func (p *parser) parseStage() (Stage, error) {
 		return p.parseRex()
 	case "timechart":
 		return p.parseTimechart()
+	case "lookup":
+		return p.parseLookup()
 	case "ranges":
 		p.pos++
 		return &RangesStage{}, nil
@@ -94,7 +105,7 @@ func (p *parser) parseStage() (Stage, error) {
 		return p.parseTransaction()
 	default:
 		return nil, fmt.Errorf(
-			"unsupported command %q — this is a subset of Splunk SPL. Supported: where (or search), eval, rex, stats, timechart, table (or fields), sort, head, tail, and the ClaudeScope extensions ranges, transaction",
+			"unsupported command %q — this is a subset of Splunk SPL. Supported: where (or search), eval, rex, stats, timechart, lookup, table (or fields), sort, head, tail, and the ClaudeScope extensions ranges, transaction",
 			t.text)
 	}
 }
@@ -501,6 +512,70 @@ func (p *parser) parseRex() (Stage, error) {
 		return nil, fmt.Errorf("rex regular expression must define at least one named group, e.g. (?<channel>\\d+)")
 	}
 	return &RexStage{Field: canonField(fld.text), Re: re, Groups: groups}, nil
+}
+
+// --- lookup ---
+
+// parseLookup is a ClaudeScope extension, simplified from real SPL's lookup
+// (which supports lookup tables registered by name and more elaborate
+// AS/OUTPUT renaming): `lookup "<path>.csv" <field> output <col> [as <alias>]
+// (',' <col> [as <alias>])*`. <field> must also be the CSV's key column name.
+func (p *parser) parseLookup() (Stage, error) {
+	p.pos++ // consume 'lookup'
+	pathTok := p.cur()
+	if pathTok.kind != tString {
+		return nil, fmt.Errorf(`lookup requires a quoted CSV path: lookup "<path>" <field> output <column>...`)
+	}
+	p.pos++
+	keyTok := p.cur()
+	if keyTok.kind != tIdent {
+		return nil, fmt.Errorf("expected a field name after the lookup path")
+	}
+	keyField := canonField(keyTok.text)
+	p.pos++
+	if !(p.cur().kind == tIdent && strings.EqualFold(p.cur().text, "output")) {
+		return nil, fmt.Errorf("lookup requires 'output <column>...' after the key field")
+	}
+	p.pos++
+
+	type outSpec struct{ col, alias string }
+	var specs []outSpec
+	for {
+		c := p.cur()
+		if c.kind != tIdent {
+			return nil, fmt.Errorf("expected a CSV column name after 'output'")
+		}
+		p.pos++
+		alias := c.text
+		if p.cur().kind == tIdent && strings.EqualFold(p.cur().text, "as") {
+			p.pos++
+			a := p.cur()
+			if a.kind != tIdent {
+				return nil, fmt.Errorf("expected alias name after 'as'")
+			}
+			alias = a.text
+			p.pos++
+		}
+		specs = append(specs, outSpec{col: c.text, alias: alias})
+		if p.cur().kind != tComma {
+			break
+		}
+		p.pos++
+	}
+
+	cols := make([]string, len(specs))
+	for i, s := range specs {
+		cols[i] = s.col
+	}
+	tables, err := loadLookupTables(pathTok.text, keyField, cols)
+	if err != nil {
+		return nil, err
+	}
+	outputs := make([]lookupOutput, len(specs))
+	for i, s := range specs {
+		outputs[i] = lookupOutput{alias: s.alias, table: tables[s.col]}
+	}
+	return &LookupStage{KeyField: keyField, Outputs: outputs}, nil
 }
 
 // --- timechart / transaction ---

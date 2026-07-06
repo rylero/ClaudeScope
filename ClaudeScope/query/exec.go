@@ -117,6 +117,54 @@ func (s *RexStage) Exec(t *EventTable) (*EventTable, error) {
 	return t, nil
 }
 
+// --- lookup ---
+
+// lookupOutput is one `output <csv column> [as <alias>]` clause: a
+// precomputed key-value -> output-value map loaded from the CSV at parse
+// time, plus the EventTable column name it gets stored under.
+type lookupOutput struct {
+	alias string
+	table map[string]string
+}
+
+// LookupStage left-joins a static CSV onto the EventTable by equality on
+// KeyField, adding one new column per requested output. Rows whose key has no
+// matching CSV row get nil for every output column.
+type LookupStage struct {
+	KeyField string
+	Outputs  []lookupOutput
+}
+
+func (s *LookupStage) CollectFields(out map[string]bool) { out[s.KeyField] = true }
+
+func (s *LookupStage) ProducedFields() []string {
+	out := make([]string, len(s.Outputs))
+	for i, o := range s.Outputs {
+		out[i] = o.alias
+	}
+	return out
+}
+
+func (s *LookupStage) Exec(t *EventTable) (*EventTable, error) {
+	keyCol, ok := t.Columns[s.KeyField]
+	if !ok {
+		return nil, fmt.Errorf("unknown field: %s", s.KeyField)
+	}
+	for _, o := range s.Outputs {
+		col := make([]any, len(t.Timestamps))
+		for i := range t.Timestamps {
+			if keyCol[i] == nil {
+				continue
+			}
+			if v, ok := o.table[fmt.Sprint(keyCol[i])]; ok {
+				col[i] = v
+			}
+		}
+		t.Columns[o.alias] = col
+	}
+	return t, nil
+}
+
 // --- table ---
 
 type TableStage struct{ Fields []string }
