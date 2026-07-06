@@ -53,21 +53,30 @@ def test_invoke_raises_on_cli_error_payload(monkeypatch):
     assert "no active session" in str(exc.value)
 
 
-def test_invoke_unwraps_double_encoded_daemon_error(monkeypatch):
-    # main.go's writeErrorAndExit stuffs a failed daemon request's own JSON
-    # error body verbatim into another {"error", "code"} envelope.
+def test_invoke_bytes_returns_raw_stdout(monkeypatch):
     monkeypatch.setattr(_cli, "_binary", lambda: "ClaudeScope")
-    inner = json.dumps({"error": "key not found: NoSuchField", "code": "QUERY_ERROR"})
-    outer = {"error": inner, "code": "COMMAND_FAILED"}
+    raw = b"\x50\x41\x52\x31fake-parquet-bytes"
 
-    def fake_run(cmd, capture_output, text):
-        return FakeProc(stdout=json.dumps(outer), returncode=1)
+    def fake_run(cmd, capture_output):
+        assert cmd == ["ClaudeScope", "query", "table Timestamp", "--format", "parquet"]
+        return FakeProc(stdout=raw, returncode=0)
+
+    monkeypatch.setattr(_cli.subprocess, "run", fake_run)
+    assert _cli.invoke_bytes(["query", "table Timestamp", "--format", "parquet"]) == raw
+
+
+def test_invoke_bytes_raises_on_cli_error_payload(monkeypatch):
+    monkeypatch.setattr(_cli, "_binary", lambda: "ClaudeScope")
+    error_payload = {"error": "session not found: abc", "code": "SESSION_NOT_FOUND"}
+
+    def fake_run(cmd, capture_output):
+        return FakeProc(stdout=json.dumps(error_payload).encode(), returncode=1)
 
     monkeypatch.setattr(_cli.subprocess, "run", fake_run)
     with pytest.raises(ClaudeScopeError) as exc:
-        _cli.invoke(["query", "stats avg(NoSuchField)"])
-    assert exc.value.code == "QUERY_ERROR"
-    assert str(exc.value) == "key not found: NoSuchField"
+        _cli.invoke_bytes(["query", "table Timestamp", "--format", "parquet", "--session", "abc"])
+    assert exc.value.code == "SESSION_NOT_FOUND"
+    assert "session not found" in str(exc.value)
 
 
 def test_invoke_raises_on_nonjson_failure(monkeypatch):

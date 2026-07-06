@@ -1,9 +1,17 @@
+import io
+
 import pandas as pd
 import pytest
 
 import claudescope as scope
 from claudescope import _cli
 from claudescope.exceptions import ClaudeScopeError
+
+
+def _parquet_bytes(rows: list[dict]) -> bytes:
+    buf = io.BytesIO()
+    pd.DataFrame(rows).to_parquet(buf)
+    return buf.getvalue()
 
 
 def test_load_returns_session(monkeypatch):
@@ -22,11 +30,11 @@ def test_load_returns_session(monkeypatch):
 
 
 def test_query_returns_dataframe(monkeypatch):
-    def fake_invoke(args):
-        assert args == ["query", "stats avg(BatteryVoltage) by Subsystem", "--session", "s1"]
-        return {"result": [{"Subsystem": "Drive", "avg(BatteryVoltage)": 12.1}]}
+    def fake_invoke_bytes(args):
+        assert args == ["query", "stats avg(BatteryVoltage) by Subsystem", "--format", "parquet", "--session", "s1"]
+        return _parquet_bytes([{"Subsystem": "Drive", "avg(BatteryVoltage)": 12.1}])
 
-    monkeypatch.setattr(_cli, "invoke", fake_invoke)
+    monkeypatch.setattr(_cli, "invoke_bytes", fake_invoke_bytes)
     session = scope.Session("s1", "log", "x.wpilog")
     df = session.query("stats avg(BatteryVoltage) by Subsystem")
     assert isinstance(df, pd.DataFrame)
@@ -34,13 +42,21 @@ def test_query_returns_dataframe(monkeypatch):
 
 
 def test_query_passes_start_end(monkeypatch):
-    def fake_invoke(args):
-        assert args == ["query", "table Timestamp", "--session", "s1", "--start", "100", "--end", "200"]
-        return {"result": []}
+    def fake_invoke_bytes(args):
+        assert args == ["query", "table Timestamp", "--format", "parquet", "--session", "s1", "--start", "100", "--end", "200"]
+        return _parquet_bytes([])
 
-    monkeypatch.setattr(_cli, "invoke", fake_invoke)
+    monkeypatch.setattr(_cli, "invoke_bytes", fake_invoke_bytes)
     session = scope.Session("s1", "log", "x.wpilog")
     session.query("table Timestamp", start=100, end=200)
+
+
+def test_query_empty_bytes_returns_empty_dataframe(monkeypatch):
+    monkeypatch.setattr(_cli, "invoke_bytes", lambda args: b"")
+    session = scope.Session("s1", "log", "x.wpilog")
+    df = session.query("table Timestamp")
+    assert isinstance(df, pd.DataFrame)
+    assert df.empty
 
 
 def test_query_multi_union_attaches_errors(monkeypatch):

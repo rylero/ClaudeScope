@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from typing import Any, Optional
 
 import pandas as pd
@@ -68,10 +69,17 @@ class Session:
         return _cli.invoke(args)
 
     def query(self, spl: str, start: int = 0, end: int = 0) -> pd.DataFrame:
-        """Run an SPL-subset pipe query and return the result rows as a DataFrame."""
-        args = ["query", spl] + self._session_flags(start=start, end=end)
-        data = _cli.invoke(args)
-        return pd.DataFrame(data.get("result") or [])
+        """Run an SPL-subset pipe query and return the result rows as a DataFrame.
+
+        Fetched as Parquet rather than JSON: faster to transfer/parse for
+        large results and preserves column dtypes (bool/float/string) instead
+        of going through pandas' JSON type inference.
+        """
+        args = ["query", spl, "--format", "parquet"] + self._session_flags(start=start, end=end)
+        raw = _cli.invoke_bytes(args)
+        if not raw:
+            return pd.DataFrame()
+        return pd.read_parquet(io.BytesIO(raw))
 
     def set(self, **pairs: Any) -> None:
         """Publish key/value pairs to a live NT session. Fails on log sessions."""
