@@ -325,27 +325,10 @@ func (s *wpilogSession) FindBoolRanges(key string, value bool) ([]TimeRange, err
 	if !ok {
 		return nil, fmt.Errorf("key not found: %s", key)
 	}
-	pts := s.data[id]
-	var ranges []TimeRange
-	inRange := false
-	var rangeStart int64
-	for _, p := range pts {
-		v, ok := p.Value.(bool)
-		if !ok {
-			continue
-		}
-		if v == value && !inRange {
-			inRange = true
-			rangeStart = p.Timestamp
-		} else if v != value && inRange {
-			ranges = append(ranges, TimeRange{Start: rangeStart, End: p.Timestamp})
-			inRange = false
-		}
-	}
-	if inRange {
-		ranges = append(ranges, TimeRange{Start: rangeStart, End: s.end})
-	}
-	return ranges, nil
+	return FindRuns(s.data[id], s.end, func(v any) (matches, applicable bool) {
+		b, ok := v.(bool)
+		return ok && b == value, ok
+	}), nil
 }
 
 func (s *wpilogSession) FindThresholdRanges(key string, min, max float64) ([]TimeRange, error) {
@@ -353,28 +336,38 @@ func (s *wpilogSession) FindThresholdRanges(key string, min, max float64) ([]Tim
 	if !ok {
 		return nil, fmt.Errorf("key not found: %s", key)
 	}
-	pts := s.data[id]
+	return FindRuns(s.data[id], s.end, func(v any) (matches, applicable bool) {
+		f, err := ToFloat64(v)
+		return err == nil && f >= min && f <= max, err == nil
+	}), nil
+}
+
+// FindRuns collapses pts into contiguous [start,end) intervals where pred(value)
+// matches. Points pred deems inapplicable (wrong type for the field) are
+// skipped without affecting an open run. A run still open at the last point
+// is closed at logEnd. Shared by FindBoolRanges, FindThresholdRanges, and the
+// query package's `ranges` stage.
+func FindRuns(pts []DataPoint, logEnd int64, pred func(any) (matches, applicable bool)) []TimeRange {
 	var ranges []TimeRange
 	inRange := false
 	var rangeStart int64
 	for _, p := range pts {
-		v, err := toFloat64(p.Value)
-		if err != nil {
+		match, applicable := pred(p.Value)
+		if !applicable {
 			continue
 		}
-		inBounds := v >= min && v <= max
-		if inBounds && !inRange {
+		if match && !inRange {
 			inRange = true
 			rangeStart = p.Timestamp
-		} else if !inBounds && inRange {
+		} else if !match && inRange {
 			ranges = append(ranges, TimeRange{Start: rangeStart, End: p.Timestamp})
 			inRange = false
 		}
 	}
 	if inRange {
-		ranges = append(ranges, TimeRange{Start: rangeStart, End: s.end})
+		ranges = append(ranges, TimeRange{Start: rangeStart, End: logEnd})
 	}
-	return ranges, nil
+	return ranges
 }
 
 func (s *wpilogSession) Stats(key string, start, end int64) (*Stats, error) {
@@ -395,7 +388,7 @@ func (s *wpilogSession) Stats(key string, start, end int64) (*Stats, error) {
 
 	var vals []float64
 	for _, p := range pts {
-		v, err := toFloat64(p.Value)
+		v, err := ToFloat64(p.Value)
 		if err != nil {
 			continue
 		}
@@ -416,18 +409,18 @@ func (s *wpilogSession) Stats(key string, start, end int64) (*Stats, error) {
 
 	stats := &Stats{
 		Mean:   sum / float64(len(sorted)),
-		Median: percentile(sorted, 0.5),
+		Median: Percentile(sorted, 0.5),
 		Min:    sorted[0],
 		Max:    sorted[len(sorted)-1],
-		Q1:     percentile(sorted, 0.25),
-		Q3:     percentile(sorted, 0.75),
+		Q1:     Percentile(sorted, 0.25),
+		Q3:     Percentile(sorted, 0.75),
 	}
 
 	if len(pts) >= 2 {
 		var deltas []float64
 		for i := 1; i < len(pts); i++ {
-			v0, e0 := toFloat64(pts[i-1].Value)
-			v1, e1 := toFloat64(pts[i].Value)
+			v0, e0 := ToFloat64(pts[i-1].Value)
+			v1, e1 := ToFloat64(pts[i].Value)
 			if e0 != nil || e1 != nil {
 				continue
 			}
@@ -466,7 +459,7 @@ func (s *wpilogSession) Close() error { return nil }
 
 // --- helpers ---
 
-func percentile(sorted []float64, p float64) float64 {
+func Percentile(sorted []float64, p float64) float64 {
 	n := len(sorted)
 	if n == 1 {
 		return sorted[0]
@@ -480,7 +473,7 @@ func percentile(sorted []float64, p float64) float64 {
 	return sorted[lo]*(1-(idx-float64(lo))) + sorted[hi]*(idx-float64(lo))
 }
 
-func toFloat64(v any) (float64, error) {
+func ToFloat64(v any) (float64, error) {
 	switch val := v.(type) {
 	case float64:
 		return val, nil
