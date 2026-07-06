@@ -504,3 +504,49 @@ func TestRunCommand_Query_Parquet_RoundTrip(t *testing.T) {
 		t.Errorf("row 1 Subsystem: expected nil, got %#v", rows[1]["Subsystem"])
 	}
 }
+
+// TestRunCommand_Query_Parquet_PreservesFalsyValues guards against a real
+// bug found via end-to-end testing: parquet-go's reflect-based map writer
+// (the plain w.Write([]map[string]any{...}) path) treats any Go zero value
+// -- false, 0.0, "" -- as equivalent to an absent key when the column is
+// Optional, so a legitimate "Enabled: false" or "Current: 0.0" reading was
+// silently coming back as a Parquet null. rowsToParquet must build rows
+// manually (parquet.Row with explicit definition levels) to avoid that path.
+func TestRunCommand_Query_Parquet_PreservesFalsyValues(t *testing.T) {
+	serveFake(t, map[string]any{"/query": map[string]any{
+		"result": []map[string]any{
+			{"Timestamp": 0.0, "Enabled": false, "Current": 0.0, "Label": ""},
+			{"Timestamp": 1000.0, "Enabled": true, "Current": 5.0, "Label": "ok"},
+		},
+	}})
+	out, err := RunCommand([]string{"query", "table Timestamp, Enabled, Current, Label", "--session", "abc", "--format", "parquet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := parquet.OpenFile(bytes.NewReader(out), int64(len(out)))
+	if err != nil {
+		t.Fatalf("output is not a valid parquet file: %v", err)
+	}
+	r := parquet.NewGenericReader[map[string]any](bytes.NewReader(out), f.Schema())
+	rows := make([]map[string]any, 2)
+	for i := range rows {
+		rows[i] = map[string]any{}
+	}
+	if n, err := r.Read(rows); n != 2 {
+		t.Fatalf("expected 2 rows, got %d (err=%v)", n, err)
+	}
+
+	if v, ok := rows[0]["Timestamp"].(float64); !ok || v != 0.0 {
+		t.Errorf("row 0 Timestamp: expected float64 0.0 (not null), got %#v", rows[0]["Timestamp"])
+	}
+	if v, ok := rows[0]["Enabled"].(bool); !ok || v != false {
+		t.Errorf("row 0 Enabled: expected bool false (not null), got %#v", rows[0]["Enabled"])
+	}
+	if v, ok := rows[0]["Current"].(float64); !ok || v != 0.0 {
+		t.Errorf("row 0 Current: expected float64 0.0 (not null), got %#v", rows[0]["Current"])
+	}
+	if v, ok := rows[0]["Label"].(string); !ok || v != "" {
+		t.Errorf("row 0 Label: expected empty string (not null), got %#v", rows[0]["Label"])
+	}
+}

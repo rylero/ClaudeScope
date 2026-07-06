@@ -524,27 +524,48 @@ func rowsToParquet(rows []map[string]any) ([]byte, error) {
 	}
 	schema := parquet.NewSchema("row", group)
 
-	out := make([]map[string]any, len(rows))
+	// Column index per name, needed to build parquet.Row values directly
+	// below. We deliberately do NOT go through GenericWriter's map/reflect
+	// path (e.g. w.Write([]map[string]any{...})): its isNullValue check
+	// (column_buffer_reflect.go) treats any Go zero value -- false, 0,
+	// "" -- as null for Optional columns, indistinguishable from a genuinely
+	// absent key. That would silently turn a real "Enabled: false" or
+	// "Current: 0.0" reading into a null in the output. Building Row values
+	// explicitly with Level(repetition, definition, columnIndex) lets us
+	// mark exactly the absent keys as null (definition level 0) and every
+	// present value -- including zero values -- as non-null (level 1).
+	colIndex := make(map[string]int, len(cols))
+	for _, c := range cols {
+		leaf, ok := schema.Lookup(c)
+		if !ok {
+			return nil, fmt.Errorf("internal error: column %q missing from generated parquet schema", c)
+		}
+		colIndex[c] = leaf.ColumnIndex
+	}
+
+	prows := make([]parquet.Row, len(rows))
 	for i, row := range rows {
-		converted := make(map[string]any, len(cols))
+		pr := make(parquet.Row, len(cols))
 		for _, c := range cols {
+			ci := colIndex[c]
 			v, ok := row[c]
 			if !ok || v == nil {
-				continue // absent key = null in the Optional column
+				pr[ci] = parquet.Value{}.Level(0, 0, ci)
+				continue
 			}
 			if kinds[c] == kindString {
 				if _, isStr := v.(string); !isStr {
 					v = fmt.Sprintf("%v", v)
 				}
 			}
-			converted[c] = v
+			pr[ci] = parquet.ValueOf(v).Level(0, 1, ci)
 		}
-		out[i] = converted
+		prows[i] = pr
 	}
 
 	var buf bytes.Buffer
 	w := parquet.NewGenericWriter[map[string]any](&buf, schema)
-	if _, err := w.Write(out); err != nil {
+	if _, err := w.WriteRows(prows); err != nil {
 		return nil, fmt.Errorf("write parquet rows: %w", err)
 	}
 	if err := w.Close(); err != nil {
