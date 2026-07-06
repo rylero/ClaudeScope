@@ -147,9 +147,9 @@ func TestSPLSpaceSeparatedAndTimeAlias(t *testing.T) {
 }
 
 func TestUnsupportedCommandError(t *testing.T) {
-	_, err := query.Parse("where CurrentA > 40 | timechart span=1s avg(CurrentA)")
+	_, err := query.Parse("where CurrentA > 40 | dedup CurrentA")
 	if err == nil {
-		t.Fatal("expected error for unsupported 'timechart' command")
+		t.Fatal("expected error for unsupported 'dedup' command")
 	}
 	if !strings.Contains(err.Error(), "subset of Splunk SPL") {
 		t.Errorf("error should point the user at the supported SPL subset, got: %v", err)
@@ -249,12 +249,87 @@ func TestSlashPathFieldInWhere(t *testing.T) {
 	}
 }
 
+func TestTimechartBucketsBySpan(t *testing.T) {
+	sess := buildTestLog()
+	// span=1ms=1000us matches the fixture's own point spacing (0,1000,2000,3000),
+	// so each CurrentA sample lands in its own bucket.
+	res, err := query.Run(sess, "timechart span=1ms avg(CurrentA)", 0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rows := res.([]map[string]any)
+	if len(rows) != 4 {
+		t.Fatalf("expected 4 buckets, got %d: %+v", len(rows), rows)
+	}
+	wantBuckets := []int64{0, 1000, 2000, 3000}
+	wantAvg := []float64{10, 50, 45, 5}
+	for i, row := range rows {
+		if row["Timestamp"] != wantBuckets[i] {
+			t.Errorf("row %d: bucket = %v, want %v", i, row["Timestamp"], wantBuckets[i])
+		}
+		if row["avg(CurrentA)"].(float64) != wantAvg[i] {
+			t.Errorf("row %d: avg(CurrentA) = %v, want %v", i, row["avg(CurrentA)"], wantAvg[i])
+		}
+	}
+}
+
+func TestTimechartGroupBySplitsSameBucket(t *testing.T) {
+	sess := buildTestLog()
+	// Enabled flips false at t=2500, which falls in the same 1000us bucket
+	// (2000) as CurrentA's t=2000 sample -> two rows for bucket 2000, one per
+	// Enabled value.
+	res, err := query.Run(sess, "timechart span=1ms avg(CurrentA) by Enabled", 0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rows := res.([]map[string]any)
+	if len(rows) != 5 {
+		t.Fatalf("expected 5 (bucket,group) rows, got %d: %+v", len(rows), rows)
+	}
+	var bucket2000Groups []any
+	for _, row := range rows {
+		if row["Timestamp"] == int64(2000) {
+			bucket2000Groups = append(bucket2000Groups, row["Enabled"])
+		}
+	}
+	if len(bucket2000Groups) != 2 {
+		t.Errorf("expected bucket 2000 split into 2 groups, got %+v", bucket2000Groups)
+	}
+}
+
+func TestTransactionGroupsAndMasksOutsideRows(t *testing.T) {
+	sess := buildTestLog()
+	// Enabled is true from t=0, goes false at t=2500. Rows [0,1000,2000,2500]
+	// form one transaction; t=3000 (Enabled still false, no new start) is
+	// masked out.
+	res, err := query.Run(sess, "transaction start=(Enabled == true) end=(Enabled == false) | table _time transactionID CurrentA", 0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rows := res.([]map[string]any)
+	if len(rows) != 4 {
+		t.Fatalf("expected 4 rows in the transaction, got %d: %+v", len(rows), rows)
+	}
+	for _, row := range rows {
+		if row["transactionID"] != "1" {
+			t.Errorf("expected transactionID=1 for row %+v", row)
+		}
+	}
+	last := rows[len(rows)-1]["Timestamp"]
+	if last != int64(2500) {
+		t.Errorf("expected transaction to close at t=2500, last row was t=%v", last)
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	cases := []string{
 		"",
 		"bogus stage",
 		"where CurrentA >",
 		"stats notarealagg(CurrentA)",
+		"transaction start=(Enabled == true)",
+		"timechart avg(CurrentA)",
+		"timechart span=1x avg(CurrentA)",
 	}
 	for _, q := range cases {
 		if _, err := query.Parse(q); err == nil {

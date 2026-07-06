@@ -127,12 +127,14 @@ MSYS_NO_PATHCONV=1 ClaudeScope query "where CurrentA > 40 and CurrentB > 40 | st
 | `eval <name> = <expr>` | computed column; `+ - * /`, parens, functions `abs round sqrt ceil floor min max pow`. **Put spaces around operators** (`a - b`, not `a-b`) — field names may contain `-`/`/`. |
 | `rex field=<field> "<regex>"` | extract named groups from a string field into new columns; use `(?<name>...)` (SPL/PCRE syntax, auto-translated to Go's `(?P<name>...)`) |
 | `stats <agg>(<field>) [as <alias>] [by <field>...]` | aggs: `avg min max sum count median stdev p50 p90 p99` |
+| `timechart span=<duration> <agg>(<field>)... [by <field>]` | buckets rows into fixed time spans, applying the same aggs as `stats` per bucket. Span units: `us ms s m h d` (e.g. `span=500ms`, `span=1m`). |
 | `table <field>...` (alias `fields`) | comma **or** space separated; `_time` = the Timestamp column |
 | `sort [-]<field>` | `-` prefix = descending |
 | `head N` / `tail N` | first/last N rows |
 | `ranges` | **ClaudeScope extension, not SPL.** Must be the last stage. Collapses matching rows into `[{start,end}]` intervals — the multi-field version of `find-bool`/`find-threshold`. |
+| `transaction start=<expr> end=<expr>` | **ClaudeScope extension, not SPL** (real SPL `transaction` has different, field-correlation semantics). Groups rows into episodes bounded by the two predicates, stamping a `transactionID` column; rows outside any episode are dropped. Pair with `stats ... by transactionID`. |
 
-**Not supported (returns an error):** `timechart`, `dedup`, subsearches, `lookup`, `join`, `transaction`. For time bucketing, fall back to `range` + client-side math for now.
+**Not supported (returns an error):** `dedup`, subsearches, `lookup`, `join`.
 
 Returns: `{"result":[{"Timestamp":<µs>,"<field>":<value>,...},...]}`, or `{"result":[{"start":<µs>,"end":<µs>},...]}` when the pipeline ends in `ranges`.
 
@@ -146,6 +148,10 @@ MSYS_NO_PATHCONV=1 ClaudeScope query "table _time CurrentA | sort -CurrentA | he
 MSYS_NO_PATHCONV=1 ClaudeScope query "eval imbalance = abs(CurrentA - CurrentB) | where imbalance > 15 | ranges" --session <id>
 # extract channel numbers from driver-station messages and count them
 MSYS_NO_PATHCONV=1 ClaudeScope query 'rex field=/DriverStation/Message "channel (?<ch>\d+)" | stats count by ch' --session <id>
+# average current draw per 500ms bucket, split by subsystem
+MSYS_NO_PATHCONV=1 ClaudeScope query "timechart span=500ms avg(CurrentA) by Subsystem" --session <id>
+# average battery voltage during each autonomous-enabled episode
+MSYS_NO_PATHCONV=1 ClaudeScope query "transaction start=(AutonomousEnabled == true) end=(AutonomousEnabled == false) | stats avg(BatteryVoltage) by transactionID" --session <id>
 ```
 
 ### Set NT value (live sessions only)
