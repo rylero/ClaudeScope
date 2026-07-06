@@ -443,6 +443,17 @@ func TestRunCommand_QueryMulti_ParquetRequiresUnion(t *testing.T) {
 	}
 }
 
+func TestRunCommand_QueryMulti_FormatRejectsPartialErrors(t *testing.T) {
+	serveFake(t, map[string]any{"/query-multi": map[string]any{
+		"result": []map[string]any{{"Timestamp": 100, "A": 1}},
+		"errors": []map[string]any{{"session_id": "bad", "error": "session not found: bad"}},
+	}})
+	_, err := RunCommand([]string{"query-multi", "table Timestamp", "--sessions", "abc,bad", "--union", "true", "--format", "csv"})
+	if err == nil {
+		t.Fatal("expected error when --format is used and some sessions in the union failed")
+	}
+}
+
 func TestRunCommand_Query_CSV_BoolFormattedForPandas(t *testing.T) {
 	serveFake(t, map[string]any{"/query": map[string]any{
 		"result": []map[string]any{

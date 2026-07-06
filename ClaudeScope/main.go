@@ -41,7 +41,11 @@ func main() {
 
 	result, err := cli.RunCommand(filteredArgs)
 	if err != nil {
-		writeErrorAndExit(err.Error(), "COMMAND_FAILED")
+		code := "COMMAND_FAILED"
+		if apiErr, ok := err.(*cli.APIError); ok && apiErr.Code != "" {
+			code = apiErr.Code
+		}
+		writeErrorAndExit(err.Error(), code)
 	}
 
 	if outFile != "" {
@@ -73,7 +77,9 @@ func ntSessionFactory(addr string) (session.DataSession, error) {
 }
 
 func writeErrorAndExit(msg, code string) {
-	json.NewEncoder(os.Stdout).Encode(map[string]string{
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetEscapeHTML(false)
+	enc.Encode(map[string]string{
 		"error": msg,
 		"code":  code,
 	})
