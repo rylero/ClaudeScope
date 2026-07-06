@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/parquet-go/parquet-go"
 )
 
 func serveFake(t *testing.T, responses map[string]any) {
@@ -430,5 +433,74 @@ func TestRunCommand_QueryMulti_CSVRequiresUnion(t *testing.T) {
 	_, err := RunCommand([]string{"query-multi", "table Timestamp", "--all", "true", "--format", "csv"})
 	if err == nil {
 		t.Fatal("expected error when --format csv is used without --union true")
+	}
+}
+
+func TestRunCommand_QueryMulti_ParquetRequiresUnion(t *testing.T) {
+	_, err := RunCommand([]string{"query-multi", "table Timestamp", "--all", "true", "--format", "parquet"})
+	if err == nil {
+		t.Fatal("expected error when --format parquet is used without --union true")
+	}
+}
+
+func TestRunCommand_Query_CSV_BoolFormattedForPandas(t *testing.T) {
+	serveFake(t, map[string]any{"/query": map[string]any{
+		"result": []map[string]any{
+			{"Timestamp": 100, "Enabled": true},
+			{"Timestamp": 200, "Enabled": false},
+		},
+	}})
+	out, err := RunCommand([]string{"query", "table Timestamp, Enabled", "--session", "abc", "--format", "csv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Timestamp,Enabled\n100,True\n200,False\n"
+	if string(out) != want {
+		t.Errorf("expected %q, got %q", want, string(out))
+	}
+}
+
+func TestRunCommand_Query_Parquet_RoundTrip(t *testing.T) {
+	serveFake(t, map[string]any{"/query": map[string]any{
+		"result": []map[string]any{
+			{"Timestamp": 100.0, "BatteryVoltage": 12.1, "Enabled": true, "Subsystem": "drive"},
+			{"Timestamp": 200.0, "Enabled": false},
+		},
+	}})
+	out, err := RunCommand([]string{"query", "table Timestamp, BatteryVoltage, Enabled, Subsystem", "--session", "abc", "--format", "parquet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := parquet.OpenFile(bytes.NewReader(out), int64(len(out)))
+	if err != nil {
+		t.Fatalf("output is not a valid parquet file: %v", err)
+	}
+	r := parquet.NewGenericReader[map[string]any](bytes.NewReader(out), f.Schema())
+	rows := make([]map[string]any, 2)
+	for i := range rows {
+		rows[i] = map[string]any{}
+	}
+	n, err := r.Read(rows)
+	if n != 2 {
+		t.Fatalf("expected 2 rows, got %d (err=%v)", n, err)
+	}
+
+	if v, ok := rows[0]["Enabled"].(bool); !ok || v != true {
+		t.Errorf("row 0 Enabled: expected bool true, got %#v", rows[0]["Enabled"])
+	}
+	if v, ok := rows[0]["BatteryVoltage"].(float64); !ok || v != 12.1 {
+		t.Errorf("row 0 BatteryVoltage: expected float64 12.1, got %#v", rows[0]["BatteryVoltage"])
+	}
+	if v, ok := rows[0]["Subsystem"].(string); !ok || v != "drive" {
+		t.Errorf("row 0 Subsystem: expected string drive, got %#v", rows[0]["Subsystem"])
+	}
+	// Row 1 omits BatteryVoltage/Subsystem entirely -- must round-trip as
+	// Parquet nulls, not zero values or empty strings.
+	if rows[1]["BatteryVoltage"] != nil {
+		t.Errorf("row 1 BatteryVoltage: expected nil, got %#v", rows[1]["BatteryVoltage"])
+	}
+	if rows[1]["Subsystem"] != nil {
+		t.Errorf("row 1 Subsystem: expected nil, got %#v", rows[1]["Subsystem"])
 	}
 }
