@@ -383,3 +383,52 @@ func TestRunQueryFollow_StreamsChangedResults(t *testing.T) {
 		t.Errorf("unexpected line contents: %q", lines)
 	}
 }
+
+func TestRunCommand_Query_CSV(t *testing.T) {
+	serveFake(t, map[string]any{"/query": map[string]any{
+		"result": []map[string]any{
+			{"Timestamp": 100, "BatteryVoltage": 12.1, "Subsystem": "drive"},
+			{"Timestamp": 200, "BatteryVoltage": 11.9, "Subsystem": "arm"},
+		},
+	}})
+	out, err := RunCommand([]string{"query", "table Timestamp, BatteryVoltage, Subsystem", "--session", "abc", "--format", "csv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Timestamp,BatteryVoltage,Subsystem\n100,12.1,drive\n200,11.9,arm\n"
+	if string(out) != want {
+		t.Errorf("expected %q, got %q", want, string(out))
+	}
+}
+
+func TestRunCommand_Query_CSV_HeterogeneousColumns(t *testing.T) {
+	serveFake(t, map[string]any{"/query": map[string]any{
+		"result": []map[string]any{
+			{"Timestamp": 100, "A": 1},
+			{"Timestamp": 200, "B": 2},
+		},
+	}})
+	out, err := RunCommand([]string{"query", "stats avg(A) by B", "--session", "abc", "--format", "csv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Timestamp,A,B\n100,1,\n200,,2\n"
+	if string(out) != want {
+		t.Errorf("expected %q, got %q", want, string(out))
+	}
+}
+
+func TestRunCommand_Query_UnknownFormat(t *testing.T) {
+	serveFake(t, map[string]any{"/query": map[string]any{"result": []map[string]any{}}})
+	_, err := RunCommand([]string{"query", "table Timestamp", "--session", "abc", "--format", "xml"})
+	if err == nil {
+		t.Fatal("expected error for unsupported --format")
+	}
+}
+
+func TestRunCommand_QueryMulti_CSVRequiresUnion(t *testing.T) {
+	_, err := RunCommand([]string{"query-multi", "table Timestamp", "--all", "true", "--format", "csv"})
+	if err == nil {
+		t.Fatal("expected error when --format csv is used without --union true")
+	}
+}

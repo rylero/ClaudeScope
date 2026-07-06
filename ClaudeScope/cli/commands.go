@@ -2,14 +2,18 @@ package cli
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/parquet-go/parquet-go"
 )
 
 // Version is set at build time via -ldflags.
@@ -263,18 +267,93 @@ func runStats(args []string) ([]byte, error) {
 func runQuery(args []string) ([]byte, error) {
 	pos, flags := parseFlags(args)
 	if len(pos) < 1 {
-		return nil, fmt.Errorf(`usage: query "<pipe string>" --session <id> [--start <us>] [--end <us>] [--follow true] [--interval-ms <n>]`)
+		return nil, fmt.Errorf(`usage: query "<pipe string>" --session <id> [--start <us>] [--end <us>] [--follow true] [--interval-ms <n>] [--format json|csv]`)
 	}
 	id := flags["session"]
 	if flagBool(flags, "follow") {
+		if format := flags["format"]; format != "" && format != "json" {
+			return nil, fmt.Errorf("--format %s is not valid with --follow true (streamed output is always NDJSON)", format)
+		}
 		return nil, runQueryFollow(id, pos[0], flagInt64(flags, "interval-ms", 500))
 	}
-	return DoRequest(http.MethodPost, "/query", map[string]any{
+	data, err := DoRequest(http.MethodPost, "/query", map[string]any{
 		"session_id": id,
 		"query":      pos[0],
 		"start":      flagInt64(flags, "start", 0),
 		"end":        flagInt64(flags, "end", 0),
 	})
+	if err != nil {
+		return nil, err
+	}
+	return maybeConvertToCSV(data, flags)
+}
+
+// maybeConvertToCSV rewrites a {"result": [...]} response as CSV when
+// --format csv is set. Only row-shaped results (array of objects, as
+// produced by query/query-multi --union) can be converted; ranges output
+// ({"start","end"} pairs) also qualifies since it's an array of objects.
+func maybeConvertToCSV(data []byte, flags map[string]string) ([]byte, error) {
+	format := flags["format"]
+	if format == "" || format == "json" {
+		return data, nil
+	}
+	if format != "csv" {
+		return nil, fmt.Errorf("unsupported --format %q (use json or csv)", format)
+	}
+	var wrapper struct {
+		Result []map[string]any `json:"result"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, fmt.Errorf("--format csv requires a row-shaped result: %w", err)
+	}
+	return rowsToCSV(wrapper.Result)
+}
+
+// rowsToCSV renders rows sharing (possibly heterogeneous) columns as CSV.
+// The header is the union of all keys across rows, sorted alphabetically
+// except "Timestamp", which is pinned first when present.
+func rowsToCSV(rows []map[string]any) ([]byte, error) {
+	colSet := map[string]bool{}
+	for _, row := range rows {
+		for k := range row {
+			colSet[k] = true
+		}
+	}
+	hasTimestamp := colSet["Timestamp"]
+	delete(colSet, "Timestamp")
+	cols := make([]string, 0, len(colSet))
+	for k := range colSet {
+		cols = append(cols, k)
+	}
+	sort.Strings(cols)
+	if hasTimestamp {
+		cols = append([]string{"Timestamp"}, cols...)
+	}
+
+	var buf bytes.Buffer
+	w := csv.NewWriter(&buf)
+	if err := w.Write(cols); err != nil {
+		return nil, err
+	}
+	record := make([]string, len(cols))
+	for _, row := range rows {
+		for i, c := range cols {
+			v, ok := row[c]
+			if !ok || v == nil {
+				record[i] = ""
+				continue
+			}
+			record[i] = fmt.Sprintf("%v", v)
+		}
+		if err := w.Write(record); err != nil {
+			return nil, err
+		}
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // runQueryFollow re-runs the query against the full live range on an
@@ -364,7 +443,7 @@ func resolveLiveSessionID(id string) (string, error) {
 func runQueryMulti(args []string) ([]byte, error) {
 	pos, flags := parseFlags(args)
 	if len(pos) < 1 {
-		return nil, fmt.Errorf(`usage: query-multi "<pipe string>" (--sessions id1,id2,... | --all true) [--union true] [--start <us>] [--end <us>]`)
+		return nil, fmt.Errorf(`usage: query-multi "<pipe string>" (--sessions id1,id2,... | --all true) [--union true] [--start <us>] [--end <us>] [--format json|csv]`)
 	}
 	all := flagBool(flags, "all")
 	var ids []string
@@ -374,14 +453,22 @@ func runQueryMulti(args []string) ([]byte, error) {
 	if !all && len(ids) == 0 {
 		return nil, fmt.Errorf("query-multi requires --sessions id1,id2,... or --all true")
 	}
-	return DoRequest(http.MethodPost, "/query-multi", map[string]any{
+	union := flagBool(flags, "union")
+	if flags["format"] == "csv" && !union {
+		return nil, fmt.Errorf("--format csv requires --union true (comparison mode isn't row-shaped)")
+	}
+	data, err := DoRequest(http.MethodPost, "/query-multi", map[string]any{
 		"session_ids": ids,
 		"all":         all,
 		"query":       pos[0],
 		"start":       flagInt64(flags, "start", 0),
 		"end":         flagInt64(flags, "end", 0),
-		"union":       flagBool(flags, "union"),
+		"union":       union,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return maybeConvertToCSV(data, flags)
 }
 
 func runVersion() ([]byte, error) {
@@ -422,6 +509,7 @@ func runHelp() ([]byte, error) {
 			"--session is optional when exactly one session is active; it defaults to that session. With multiple sessions, an AMBIGUOUS_SESSION error lists the IDs.",
 			"Global flag: append --out <file> to any command to write its output to a file instead of stdout.",
 			"query --follow true ignores --out: it streams NDJSON (one JSON object per line) directly to stdout and runs until killed, rather than returning once.",
+			"query and query-multi (--union true) accept --format csv to emit CSV instead of JSON, for direct pandas.read_csv() consumption. Header columns are alphabetically sorted with Timestamp pinned first.",
 			"Workflow: load → query (--session optional) → disconnect when done.",
 		},
 		Commands: []cmd{
@@ -531,16 +619,17 @@ func runHelp() ([]byte, error) {
 			{
 				Name:  "query",
 				Desc:  "Run a pipe query joining multiple fields on a shared, forward-filled timestamp axis. This is a SUBSET OF SPLUNK SPL: write standard SPL and it works. Supported: where (alias: search), eval <name> = <expr>, rex field=<field> \"<regex>\", stats <agg>(<field>) [as <alias>] [by <field>...], timechart span=<duration> <agg>(<field>)... [by <field>], lookup \"<path>.csv\" <field> output <col> [as <alias>][, ...] (CSV must have a header row; joins on <field> against a same-named CSV column), table (alias: fields), sort [-]<field>, head N, tail N, and the ClaudeScope-only extensions 'ranges' (must be last; collapses matching rows into [{start,end}] intervals) and 'transaction start=<expr> end=<expr>' (groups rows into episodes bounded by the two predicates, stamping a transactionID column; rows outside any episode are dropped). Aggregates: avg,min,max,sum,count,median,stdev,p50,p90,p99. timechart span units: us,ms,s,m,h,d (e.g. span=500ms, span=1m). eval operators: + - * / and functions abs,round,sqrt,ceil,floor,min,max,pow (put spaces around operators). rex uses (?<name>...) named groups. Comparison ops: > < >= <= == (= also works) != and or NOT. '_time' aliases the Timestamp column. Backtick-quoted `name` references expand named macros from ~/.claudescope/macros.json (flat JSON: name -> pipe-query text). NOT SUPPORTED (errors): dedup, subsearches, join.",
-				Usage: `ClaudeScope query "<pipe string>" --session <id> [--start <us>] [--end <us>] [--follow true] [--interval-ms <n>]`,
+				Usage: `ClaudeScope query "<pipe string>" --session <id> [--start <us>] [--end <us>] [--follow true] [--interval-ms <n>] [--format json|csv]`,
 				Params: []param{
 					{Name: "query", Type: "string", Required: true, Desc: `SPL-subset pipe query, e.g. "where CurrentA > 40 and CurrentB > 40 | stats avg(BatteryVoltage) by Subsystem"`},
 					{Name: "--session", Type: "string", Required: false, Desc: "Session ID; optional when exactly one session is active"},
 					{Name: "--start", Type: "int64", Required: false, Desc: "Start µs; 0=beginning; negative=offset from end. Ignored when --follow true (always runs 0 to now)."},
 					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log; negative=offset from end. Ignored when --follow true."},
-					{Name: "--follow", Type: "bool", Required: false, Desc: "Must be spelled out (--follow true). Re-runs the query against a live session on an interval, printing one NDJSON line to stdout per changed result instead of returning once. Runs until killed; only valid for live (connect) sessions, not loaded logs."},
+					{Name: "--follow", Type: "bool", Required: false, Desc: "Must be spelled out (--follow true). Re-runs the query against a live session on an interval, printing one NDJSON line to stdout per changed result instead of returning once. Runs until killed; only valid for live (connect) sessions, not loaded logs. Incompatible with --format (NDJSON only)."},
 					{Name: "--interval-ms", Type: "int64", Required: false, Desc: "Poll interval in milliseconds when --follow true. Default 500."},
+					{Name: "--format", Type: "string", Required: false, Desc: `"json" (default) or "csv". CSV is a plain header+rows table, ready for pandas.read_csv(). Not valid with --follow true.`},
 				},
-				Returns: `{"result":[{"Timestamp":<us>,"<field>":<value>,...},...]} or {"result":[{"start":<us>,"end":<us>},...]} when the pipeline ends in 'ranges'. With --follow true, one such JSON object per line (NDJSON) on stdout instead of a single response.`,
+				Returns: `{"result":[{"Timestamp":<us>,"<field>":<value>,...},...]} or {"result":[{"start":<us>,"end":<us>},...]} when the pipeline ends in 'ranges'. With --follow true, one such JSON object per line (NDJSON) on stdout instead of a single response. With --format csv, a CSV byte stream instead of JSON.`,
 			},
 			{
 				Name:  "query-multi",
@@ -553,8 +642,9 @@ func runHelp() ([]byte, error) {
 					{Name: "--union", Type: "bool", Required: false, Desc: "Flatten successful results into one session_id-tagged table instead of one entry per session. Must be spelled out (--union true)."},
 					{Name: "--start", Type: "int64", Required: false, Desc: "Start µs; 0=beginning; negative=offset from end"},
 					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log; negative=offset from end"},
+					{Name: "--format", Type: "string", Required: false, Desc: `"json" (default) or "csv". CSV requires --union true (comparison mode isn't row-shaped).`},
 				},
-				Returns: `{"results":[{"session_id":"...","label":"...","result":...},...]} (comparison mode) or {"result":[{"session_id":"...",...},...],"errors":[...]} (union mode)`,
+				Returns: `{"results":[{"session_id":"...","label":"...","result":...},...]} (comparison mode) or {"result":[{"session_id":"...",...},...],"errors":[...]} (union mode); with --format csv and --union true, a CSV byte stream of the result rows instead of JSON`,
 			},
 			{
 				Name:  "set",
