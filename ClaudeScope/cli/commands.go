@@ -19,6 +19,22 @@ import (
 // Version is set at build time via -ldflags.
 var Version = "dev"
 
+// marshalJSON encodes v without HTML-escaping < > & so field names/values
+// containing those characters (e.g. an SPL comparison operator quoted back
+// in an error) round-trip unmangled instead of becoming <-style escapes.
+func marshalJSON(v any, indent string) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if indent != "" {
+		enc.SetIndent("", indent)
+	}
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
 // RunCommand routes CLI args to the correct daemon endpoint.
 func RunCommand(args []string) ([]byte, error) {
 	if len(args) == 0 {
@@ -173,7 +189,7 @@ func runSearchFields(args []string) ([]byte, error) {
 			matches = append(matches, f)
 		}
 	}
-	return json.Marshal(map[string]any{"fields": matches})
+	return marshalJSON(map[string]any{"fields": matches}, "")
 }
 
 func runGet(args []string) ([]byte, error) {
@@ -302,9 +318,13 @@ func applyResultFormat(data []byte, flags map[string]string) ([]byte, error) {
 	}
 	var wrapper struct {
 		Result []map[string]any `json:"result"`
+		Errors []map[string]any `json:"errors"`
 	}
 	if err := json.Unmarshal(data, &wrapper); err != nil {
 		return nil, fmt.Errorf("--format %s requires a row-shaped result: %w", format, err)
+	}
+	if len(wrapper.Errors) > 0 {
+		return nil, fmt.Errorf("%d session(s) failed during query-multi and --format %s cannot carry per-session errors alongside row data; rerun with --format json to see them", len(wrapper.Errors), format)
 	}
 	if format == "parquet" {
 		return rowsToParquet(wrapper.Result)
@@ -606,7 +626,7 @@ func runQueryMulti(args []string) ([]byte, error) {
 }
 
 func runVersion() ([]byte, error) {
-	return json.Marshal(map[string]string{"version": Version})
+	return marshalJSON(map[string]string{"version": Version}, "")
 }
 
 func runHelp() ([]byte, error) {
@@ -792,13 +812,7 @@ func runHelp() ([]byte, error) {
 			},
 		},
 	}
-	enc, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	// json.Marshal escapes < > & by default; unescape for readability
-	enc = []byte(strings.NewReplacer(`\u003c`, "<", `\u003e`, ">", `\u0026`, "&").Replace(string(enc)))
-	return enc, nil
+	return marshalJSON(s, "  ")
 }
 
 func runSet(args []string) ([]byte, error) {

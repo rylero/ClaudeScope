@@ -33,12 +33,15 @@ and support `session.set(Speed=1.5)` in addition to querying.
   (`main.go: writeErrorAndExit`, exit code 1). The wrapper raises
   `claudescope.ClaudeScopeError` with that message and `.code` instead of a
   generic `subprocess.CalledProcessError`.
-- **`query()`**: returns a `pandas.DataFrame` built directly from the
-  `query` command's `{"result": [...]}` JSON — no CSV round-trip needed,
-  since `pd.DataFrame(list_of_dicts)` already infers dtypes.
-- **`query_multi()`**: union mode (`union=True`) returns one DataFrame
-  tagged with a `session_id` column, with any per-session errors attached
-  at `df.attrs["errors"]` (a bad log in a batch shouldn't blank out the
+- **`query()`**: fetches results as `--format parquet` rather than JSON and
+  loads them with `pd.read_parquet()`. Faster for large results and
+  preserves native bool/float64/string dtypes instead of relying on
+  pandas' JSON type inference.
+- **`query_multi()`**: union mode (`union=True`) stays on JSON — the CLI's
+  `--format` can't carry the per-session `errors` list alongside row data,
+  and this wrapper needs both. Returns one DataFrame tagged with a
+  `session_id` column, with any per-session errors attached at
+  `df.attrs["errors"]` (a bad log in a batch shouldn't blank out the
   rest). Comparison mode (default) returns `dict[session_id, DataFrame |
   ClaudeScopeError]`.
 

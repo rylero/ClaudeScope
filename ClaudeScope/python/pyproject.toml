@@ -11,6 +11,7 @@ requires-python = ">=3.9"
 license = { text = "MIT" }
 dependencies = [
     "pandas>=1.5",
+    "pyarrow>=10",
 ]
 
 [project.optional-dependencies]

@@ -13,6 +13,16 @@ import (
 
 var daemonBaseURL = "http://localhost:5812"
 
+// APIError carries the daemon's own error code (e.g. SESSION_NOT_FOUND)
+// through to main.go, instead of it being collapsed into a generic
+// COMMAND_FAILED at the top level.
+type APIError struct {
+	Msg  string
+	Code string
+}
+
+func (e *APIError) Error() string { return e.Msg }
+
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
 func PingDaemon() bool {
@@ -85,6 +95,13 @@ func DoRequest(method, path string, body any) ([]byte, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var daemonErr struct {
+			Error string `json:"error"`
+			Code  string `json:"code"`
+		}
+		if err := json.Unmarshal(data, &daemonErr); err == nil && daemonErr.Error != "" {
+			return nil, &APIError{Msg: daemonErr.Error, Code: daemonErr.Code}
+		}
 		return nil, fmt.Errorf("%s", string(data))
 	}
 	return data, nil

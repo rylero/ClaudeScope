@@ -62,25 +62,39 @@ def invoke(args: list[str]) -> Any:
 
     if proc.returncode != 0:
         if isinstance(data, dict) and "error" in data:
-            message = data["error"]
-            code = data.get("code", "COMMAND_FAILED")
-            # The CLI double-wraps a daemon HTTP error: main.go's
-            # writeErrorAndExit takes the *already-JSON* error text from a
-            # failed DoRequest and stuffs it verbatim into another "error"
-            # field. Unwrap one level so callers see the daemon's own
-            # message/code instead of a raw JSON blob.
-            if isinstance(message, str):
-                try:
-                    inner = json.loads(message)
-                except json.JSONDecodeError:
-                    inner = None
-                if isinstance(inner, dict) and "error" in inner:
-                    message = inner["error"]
-                    code = inner.get("code", code)
-            raise ClaudeScopeError(message, code=code)
+            raise ClaudeScopeError(data["error"], code=data.get("code", "COMMAND_FAILED"))
         raise ClaudeScopeError(
             proc.stderr.strip() or f"ClaudeScope exited with code {proc.returncode}",
             code="COMMAND_FAILED",
         )
 
     return data
+
+
+def invoke_bytes(args: list[str]) -> bytes:
+    """Run a CLI subcommand expecting raw bytes on stdout (e.g. --format parquet).
+
+    On a non-zero exit the CLI still writes its {"error", "code"} JSON body
+    to stdout (main.go's writeErrorAndExit ignores --format on failure), so
+    that case is decoded and raised the same way as `invoke`.
+    """
+    cmd = [_binary(), *args]
+    try:
+        proc = subprocess.run(cmd, capture_output=True)
+    except FileNotFoundError as e:
+        raise ClaudeScopeError(f"failed to launch ClaudeScope binary: {e}", code="BINARY_NOT_FOUND") from e
+
+    if proc.returncode != 0:
+        stdout = proc.stdout.decode("utf-8", errors="replace").strip()
+        try:
+            data = json.loads(stdout) if stdout else None
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict) and "error" in data:
+            raise ClaudeScopeError(data["error"], code=data.get("code", "COMMAND_FAILED"))
+        raise ClaudeScopeError(
+            proc.stderr.decode("utf-8", errors="replace").strip() or f"ClaudeScope exited with code {proc.returncode}",
+            code="COMMAND_FAILED",
+        )
+
+    return proc.stdout
