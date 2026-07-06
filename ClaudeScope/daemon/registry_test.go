@@ -11,14 +11,16 @@ import (
 // mockSession is a do-nothing DataSession for registry tests.
 type mockSession struct{ closed bool }
 
-func (m *mockSession) Type() session.SessionType                                         { return session.LogSession }
-func (m *mockSession) Fields() ([]session.FieldInfo, error)                              { return nil, nil }
-func (m *mockSession) TimeRange() (int64, int64, error)                                  { return 0, 0, nil }
-func (m *mockSession) GetValues([]string, int64) (map[string]*session.DataPoint, error)  { return nil, nil }
+func (m *mockSession) Type() session.SessionType            { return session.LogSession }
+func (m *mockSession) Fields() ([]session.FieldInfo, error) { return nil, nil }
+func (m *mockSession) TimeRange() (int64, int64, error)     { return 0, 0, nil }
+func (m *mockSession) GetValues([]string, int64) (map[string]*session.DataPoint, error) {
+	return nil, nil
+}
 func (m *mockSession) GetRanges([]string, int64, int64) (map[string][]session.DataPoint, error) {
 	return nil, nil
 }
-func (m *mockSession) FindBoolRanges(string, bool) ([]session.TimeRange, error)             { return nil, nil }
+func (m *mockSession) FindBoolRanges(string, bool) ([]session.TimeRange, error) { return nil, nil }
 func (m *mockSession) FindThresholdRanges(string, float64, float64) ([]session.TimeRange, error) {
 	return nil, nil
 }
