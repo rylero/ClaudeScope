@@ -392,6 +392,34 @@ func TestLookupMissingFileErrors(t *testing.T) {
 	}
 }
 
+// TestStatsAggregatesLookupNumericString is a regression test: lookup-joined
+// CSV columns are always strings (encoding/csv has no type inference), so a
+// numeric-looking column like "Budget" used to silently aggregate as 0 —
+// ToFloat64 rejected the string outright, evalAggs skipped every value, and
+// computeAgg's empty-vals case falls back to 0 with no error. ToFloat64 now
+// coerces numeric strings, matching how Splunk treats extracted string
+// fields in eval/stats.
+func TestStatsAggregatesLookupNumericString(t *testing.T) {
+	sess := buildTestLog()
+	csvPath := writeCSV(t, "CurrentA,Budget\n10,5\n50,40\n45,40\n5,5\n")
+	res, err := query.Run(sess,
+		`lookup "`+csvPath+`" CurrentA output Budget | stats avg(Budget) as avgBudget, max(Budget) as maxBudget`,
+		0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rows := res.([]map[string]any)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %+v", len(rows), rows)
+	}
+	if rows[0]["maxBudget"] != 40.0 {
+		t.Errorf("maxBudget = %v, want 40", rows[0]["maxBudget"])
+	}
+	if rows[0]["avgBudget"] != 22.5 {
+		t.Errorf("avgBudget = %v, want 22.5", rows[0]["avgBudget"])
+	}
+}
+
 func TestMacroExpansion(t *testing.T) {
 	dir := t.TempDir()
 	macrosPath := filepath.Join(dir, "macros.json")
@@ -554,6 +582,41 @@ func TestUnionResultsSeparatesErrors(t *testing.T) {
 	}
 	if len(errored) != 1 || errored[0].SessionID != "broken" {
 		t.Errorf("expected the broken session reported separately, got %+v", errored)
+	}
+}
+
+// TestStatsMinMaxTimestampByGroup is a regression test for
+// https://github.com/rylero/ClaudeScope/issues/24: aggregating the
+// "Timestamp" pseudo-column (e.g. min(Timestamp)/max(Timestamp)) used to
+// panic with an index-out-of-range inside evalAggs, because "Timestamp" is
+// never a real key in EventTable.Columns (Pipeline.Run pre-seeds it as
+// already "produced" so it's never fetched from the session, and it only
+// exists via the separate Timestamps slice / RowAt's pseudo-field). The
+// panic happened regardless of grouping, but the reported repro paired it
+// with `transaction | stats ... by transactionID`, so this test exercises
+// that same shape end to end.
+func TestStatsMinMaxTimestampByGroup(t *testing.T) {
+	sess := buildTestLog()
+	res, err := query.Run(sess,
+		"transaction start=(Enabled == true) end=(Enabled == false) | "+
+			"stats min(Timestamp) as t0, max(Timestamp) as t1, max(CurrentA) as peak by transactionID",
+		0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rows := res.([]map[string]any)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 group, got %d: %+v", len(rows), rows)
+	}
+	row := rows[0]
+	if row["t0"] != 0.0 {
+		t.Errorf("t0 (min Timestamp) = %v, want 0", row["t0"])
+	}
+	if row["t1"] != 2500.0 {
+		t.Errorf("t1 (max Timestamp) = %v, want 2500", row["t1"])
+	}
+	if row["peak"] != 50.0 {
+		t.Errorf("peak (max CurrentA) = %v, want 50", row["peak"])
 	}
 }
 

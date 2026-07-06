@@ -74,10 +74,22 @@ func evalAggs(t *EventTable, rowIdx []int, aggs []AggCall) ([]float64, error) {
 	for ai, a := range aggs {
 		var vals []float64
 		if a.Field != "" {
-			col := t.Columns[a.Field]
-			for _, i := range rowIdx {
-				if v, err := session.ToFloat64(col[i]); err == nil {
-					vals = append(vals, v)
+			// "Timestamp" is a pseudo-column: EventTable stores it in the
+			// dedicated Timestamps slice, not in Columns (see RowAt), and
+			// Pipeline.Run never requests it from the session because it's
+			// pre-seeded as already "produced". A raw t.Columns[a.Field]
+			// lookup for it returns a nil slice and panics on index; use the
+			// same accessor RowAt does instead.
+			if a.Field == "Timestamp" {
+				for _, i := range rowIdx {
+					vals = append(vals, float64(t.Timestamps[i]))
+				}
+			} else {
+				col := t.Columns[a.Field]
+				for _, i := range rowIdx {
+					if v, err := session.ToFloat64(col[i]); err == nil {
+						vals = append(vals, v)
+					}
 				}
 			}
 		}
