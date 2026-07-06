@@ -1,6 +1,8 @@
 package query_test
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -321,6 +323,132 @@ func TestTransactionGroupsAndMasksOutsideRows(t *testing.T) {
 	}
 }
 
+func writeCSV(t *testing.T, contents string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "lookup.csv")
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLookupJoinsOnKeyField(t *testing.T) {
+	sess := buildTestLog()
+	// CurrentA values are 10,50,45,5; map each to a subsystem name.
+	csvPath := writeCSV(t, "CurrentA,Subsystem\n10,Drive\n50,Shooter\n45,Intake\n5,Climber\n")
+	q := `lookup "` + csvPath + `" CurrentA output Subsystem`
+	res, err := query.Run(sess, q+" | table _time CurrentA Subsystem", 0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rows := res.([]map[string]any)
+	want := map[int64]string{0: "Drive", 1000: "Shooter", 2000: "Intake", 3000: "Climber"}
+	if len(rows) != len(want) {
+		t.Fatalf("expected %d rows, got %d: %+v", len(want), len(rows), rows)
+	}
+	for _, row := range rows {
+		ts := row["Timestamp"].(int64)
+		if row["Subsystem"] != want[ts] {
+			t.Errorf("t=%d: Subsystem = %v, want %v", ts, row["Subsystem"], want[ts])
+		}
+	}
+}
+
+func TestLookupUnmatchedKeyIsNil(t *testing.T) {
+	sess := buildTestLog()
+	csvPath := writeCSV(t, "CurrentA,Subsystem\n999,Nowhere\n")
+	res, err := query.Run(sess, `lookup "`+csvPath+`" CurrentA output Subsystem | table _time Subsystem`, 0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rows := res.([]map[string]any)
+	for _, row := range rows {
+		if row["Subsystem"] != nil {
+			t.Errorf("expected nil Subsystem for unmatched key, got %+v", row)
+		}
+	}
+}
+
+func TestLookupAliasAndMultipleOutputs(t *testing.T) {
+	sess := buildTestLog()
+	csvPath := writeCSV(t, "CurrentA,Subsystem,Amps\n10,Drive,LOW\n50,Shooter,HIGH\n45,Intake,HIGH\n5,Climber,LOW\n")
+	res, err := query.Run(sess,
+		`lookup "`+csvPath+`" CurrentA output Subsystem as sys, Amps as level | where _time == 1000 | table sys level`,
+		0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rows := res.([]map[string]any)
+	if len(rows) != 1 || rows[0]["sys"] != "Shooter" || rows[0]["level"] != "HIGH" {
+		t.Errorf("got %+v, want sys=Shooter level=HIGH", rows)
+	}
+}
+
+func TestLookupMissingFileErrors(t *testing.T) {
+	sess := buildTestLog()
+	_, err := query.Run(sess, `lookup "/nonexistent/path.csv" CurrentA output Subsystem`, 0, 0)
+	if err == nil {
+		t.Fatal("expected error for missing lookup file")
+	}
+}
+
+func TestMacroExpansion(t *testing.T) {
+	dir := t.TempDir()
+	macrosPath := filepath.Join(dir, "macros.json")
+	if err := os.WriteFile(macrosPath, []byte(`{"lowbattery": "where Enabled == false | ranges"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	query.SetMacrosPath(macrosPath)
+	defer query.SetMacrosPath("") // reset so later tests don't hit a stale path
+
+	sess := buildTestLog()
+	got, err := query.Run(sess, "`lowbattery`", 0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want, err := query.Run(sess, "where Enabled == false | ranges", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gr, wr := got.([]session.TimeRange), want.([]session.TimeRange)
+	if len(gr) != len(wr) || (len(wr) > 0 && gr[0] != wr[0]) {
+		t.Errorf("macro expansion: got %+v, want %+v", gr, wr)
+	}
+}
+
+func TestMacroUnknownNameErrors(t *testing.T) {
+	dir := t.TempDir()
+	macrosPath := filepath.Join(dir, "macros.json")
+	if err := os.WriteFile(macrosPath, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	query.SetMacrosPath(macrosPath)
+	defer query.SetMacrosPath("")
+
+	sess := buildTestLog()
+	_, err := query.Run(sess, "`doesnotexist`", 0, 0)
+	if err == nil {
+		t.Fatal("expected error for undefined macro")
+	}
+}
+
+func TestMacroCycleDetected(t *testing.T) {
+	dir := t.TempDir()
+	macrosPath := filepath.Join(dir, "macros.json")
+	// `a` expands to `b` and vice versa: infinite loop without depth limiting.
+	if err := os.WriteFile(macrosPath, []byte(`{"a": "`+"`b`"+`", "b": "`+"`a`"+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	query.SetMacrosPath(macrosPath)
+	defer query.SetMacrosPath("")
+
+	sess := buildTestLog()
+	_, err := query.Run(sess, "`a`", 0, 0)
+	if err == nil {
+		t.Fatal("expected error for cyclic macro expansion")
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	cases := []string{
 		"",
@@ -330,6 +458,9 @@ func TestParseErrors(t *testing.T) {
 		"transaction start=(Enabled == true)",
 		"timechart avg(CurrentA)",
 		"timechart span=1x avg(CurrentA)",
+		"lookup CurrentA output Subsystem", // missing quoted path
+		`lookup "nope.csv" CurrentA`,       // missing 'output'
+		"`undefinedmacro`",                 // no macros configured
 	}
 	for _, q := range cases {
 		if _, err := query.Parse(q); err == nil {

@@ -128,13 +128,16 @@ MSYS_NO_PATHCONV=1 ClaudeScope query "where CurrentA > 40 and CurrentB > 40 | st
 | `rex field=<field> "<regex>"` | extract named groups from a string field into new columns; use `(?<name>...)` (SPL/PCRE syntax, auto-translated to Go's `(?P<name>...)`) |
 | `stats <agg>(<field>) [as <alias>] [by <field>...]` | aggs: `avg min max sum count median stdev p50 p90 p99` |
 | `timechart span=<duration> <agg>(<field>)... [by <field>]` | buckets rows into fixed time spans, applying the same aggs as `stats` per bucket. Span units: `us ms s m h d` (e.g. `span=500ms`, `span=1m`). |
+| `lookup "<path>.csv" <field> output <col> [as <alias>][, ...]` | left-joins a static CSV onto rows by equality on `<field>` (the CSV needs a header row with a same-named column); unmatched rows get `nil`. Simplified from real SPL's `lookup` (no named lookup-table registration). |
 | `table <field>...` (alias `fields`) | comma **or** space separated; `_time` = the Timestamp column |
 | `sort [-]<field>` | `-` prefix = descending |
 | `head N` / `tail N` | first/last N rows |
 | `ranges` | **ClaudeScope extension, not SPL.** Must be the last stage. Collapses matching rows into `[{start,end}]` intervals — the multi-field version of `find-bool`/`find-threshold`. |
 | `transaction start=<expr> end=<expr>` | **ClaudeScope extension, not SPL** (real SPL `transaction` has different, field-correlation semantics). Groups rows into episodes bounded by the two predicates, stamping a `transactionID` column; rows outside any episode are dropped. Pair with `stats ... by transactionID`. |
 
-**Not supported (returns an error):** `dedup`, subsearches, `lookup`, `join`.
+**Macros:** wrap a name in backticks — `` `name` `` — to expand it from `~/.claudescope/macros.json`, a flat JSON object mapping macro name to the pipe-query text it stands for (e.g. `{"brownout": "where BatteryVoltage < 7 | ranges"}`). Macros can reference other macros; a missing file just means no macros are defined.
+
+**Not supported (returns an error):** `dedup`, subsearches, `join`.
 
 Returns: `{"result":[{"Timestamp":<µs>,"<field>":<value>,...},...]}`, or `{"result":[{"start":<µs>,"end":<µs>},...]}` when the pipeline ends in `ranges`.
 
@@ -152,6 +155,10 @@ MSYS_NO_PATHCONV=1 ClaudeScope query 'rex field=/DriverStation/Message "channel 
 MSYS_NO_PATHCONV=1 ClaudeScope query "timechart span=500ms avg(CurrentA) by Subsystem" --session <id>
 # average battery voltage during each autonomous-enabled episode
 MSYS_NO_PATHCONV=1 ClaudeScope query "transaction start=(AutonomousEnabled == true) end=(AutonomousEnabled == false) | stats avg(BatteryVoltage) by transactionID" --session <id>
+# join CAN IDs to human-readable subsystem names via a lookup CSV
+MSYS_NO_PATHCONV=1 ClaudeScope query 'lookup "canids.csv" CANID output SubsystemName as Subsystem | stats count by Subsystem' --session <id>
+# reuse a saved query (define "brownout" once in ~/.claudescope/macros.json)
+MSYS_NO_PATHCONV=1 ClaudeScope query '`brownout`' --session <id>
 ```
 
 ### Set NT value (live sessions only)
