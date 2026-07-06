@@ -66,6 +66,30 @@ func computeAgg(fn string, vals []float64, rowCount int) (float64, error) {
 	}
 }
 
+// evalAggs runs every AggCall in aggs over the given row indices of t,
+// returning one output value per call in the same order. Shared by any stage
+// that reduces a group of rows to a single output row (stats, timechart).
+func evalAggs(t *EventTable, rowIdx []int, aggs []AggCall) ([]float64, error) {
+	out := make([]float64, len(aggs))
+	for ai, a := range aggs {
+		var vals []float64
+		if a.Field != "" {
+			col := t.Columns[a.Field]
+			for _, i := range rowIdx {
+				if v, err := session.ToFloat64(col[i]); err == nil {
+					vals = append(vals, v)
+				}
+			}
+		}
+		v, err := computeAgg(a.Fn, vals, len(rowIdx))
+		if err != nil {
+			return nil, err
+		}
+		out[ai] = v
+	}
+	return out, nil
+}
+
 func sortedCopy(vals []float64) []float64 {
 	out := make([]float64, len(vals))
 	copy(out, vals)

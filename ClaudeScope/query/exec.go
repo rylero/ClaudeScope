@@ -35,13 +35,9 @@ func (s *WhereStage) Exec(t *EventTable) (*EventTable, error) {
 		if !t.Mask[i] {
 			continue
 		}
-		v, err := s.Expr.Eval(t.RowAt(i))
+		b, err := evalBool(s.Expr, t.RowAt(i), "where")
 		if err != nil {
 			return nil, err
-		}
-		b, ok := v.(bool)
-		if !ok {
-			return nil, fmt.Errorf("where expression did not evaluate to a boolean")
 		}
 		if !b {
 			t.Mask[i] = false
@@ -317,24 +313,174 @@ func (s *StatsStage) Exec(t *EventTable) (*EventTable, error) {
 		for gi, f := range s.GroupBy {
 			out.Columns[f] = append(out.Columns[f], g.key[gi])
 		}
-		for _, a := range s.Aggs {
-			var vals []float64
-			if a.Field != "" {
-				col := t.Columns[a.Field]
-				for _, i := range g.rowIdx {
-					if v, err := session.ToFloat64(col[i]); err == nil {
-						vals = append(vals, v)
-					}
-				}
-			}
-			v, err := computeAgg(a.Fn, vals, len(g.rowIdx))
-			if err != nil {
-				return nil, err
-			}
-			out.Columns[a.Alias] = append(out.Columns[a.Alias], v)
+		aggVals, err := evalAggs(t, g.rowIdx, s.Aggs)
+		if err != nil {
+			return nil, err
+		}
+		for ai, a := range s.Aggs {
+			out.Columns[a.Alias] = append(out.Columns[a.Alias], aggVals[ai])
 		}
 	}
 	return out, nil
+}
+
+// --- timechart ---
+
+// TimechartStage buckets rows into fixed-width time spans (and, optionally,
+// by a group field's value) and applies the same aggregate functions as
+// `stats` to each bucket. Output rows are sorted by bucket start, then group.
+type TimechartStage struct {
+	SpanUs  int64
+	Aggs    []AggCall
+	GroupBy string // "" if no `by` clause
+}
+
+func (s *TimechartStage) CollectFields(out map[string]bool) {
+	for _, a := range s.Aggs {
+		if a.Field != "" {
+			out[a.Field] = true
+		}
+	}
+	if s.GroupBy != "" {
+		out[s.GroupBy] = true
+	}
+}
+
+func (s *TimechartStage) ProducedFields() []string {
+	out := []string{"Timestamp"}
+	if s.GroupBy != "" {
+		out = append(out, s.GroupBy)
+	}
+	for _, a := range s.Aggs {
+		out = append(out, a.Alias)
+	}
+	return out
+}
+
+func (s *TimechartStage) Exec(t *EventTable) (*EventTable, error) {
+	if s.SpanUs <= 0 {
+		return nil, fmt.Errorf("timechart span must be positive")
+	}
+	idx := visibleIndices(t)
+
+	type bucketKey struct {
+		bucket int64
+		group  any
+	}
+	type bucketData struct {
+		key    bucketKey
+		rowIdx []int
+	}
+	buckets := make(map[bucketKey]*bucketData)
+	var order []bucketKey
+	for _, i := range idx {
+		bucket := (t.Timestamps[i] / s.SpanUs) * s.SpanUs
+		var group any
+		if s.GroupBy != "" {
+			group = t.Columns[s.GroupBy][i]
+		}
+		k := bucketKey{bucket: bucket, group: group}
+		bd, ok := buckets[k]
+		if !ok {
+			bd = &bucketData{key: k}
+			buckets[k] = bd
+			order = append(order, k)
+		}
+		bd.rowIdx = append(bd.rowIdx, i)
+	}
+	sort.Slice(order, func(a, b int) bool {
+		if order[a].bucket != order[b].bucket {
+			return order[a].bucket < order[b].bucket
+		}
+		return fmt.Sprint(order[a].group) < fmt.Sprint(order[b].group)
+	})
+
+	out := &EventTable{Columns: make(map[string][]any, 1+len(s.Aggs))}
+	if s.GroupBy != "" {
+		out.Columns[s.GroupBy] = nil
+	}
+	for _, a := range s.Aggs {
+		out.Columns[a.Alias] = nil
+	}
+	for _, k := range order {
+		bd := buckets[k]
+		out.Timestamps = append(out.Timestamps, k.bucket)
+		out.Mask = append(out.Mask, true)
+		if s.GroupBy != "" {
+			out.Columns[s.GroupBy] = append(out.Columns[s.GroupBy], k.group)
+		}
+		aggVals, err := evalAggs(t, bd.rowIdx, s.Aggs)
+		if err != nil {
+			return nil, err
+		}
+		for ai, a := range s.Aggs {
+			out.Columns[a.Alias] = append(out.Columns[a.Alias], aggVals[ai])
+		}
+	}
+	return out, nil
+}
+
+// --- transaction ---
+
+// TransactionStage is a ClaudeScope extension (not SPL) that generalizes
+// `ranges`/FindRuns to an arbitrary start/end predicate pair. Rows from a
+// `start` match up to (and including) the next `end` match are grouped into
+// one transaction and stamped with a "transactionID" column; rows outside any
+// transaction are masked out. A transaction still open at the end of the
+// visible rows keeps its ID (matches FindRuns's "close at log end" behavior).
+type TransactionStage struct {
+	Start Expr
+	End   Expr
+}
+
+func (s *TransactionStage) CollectFields(out map[string]bool) {
+	s.Start.CollectFields(out)
+	s.End.CollectFields(out)
+}
+
+func (s *TransactionStage) ProducedFields() []string { return []string{"transactionID"} }
+
+func (s *TransactionStage) Exec(t *EventTable) (*EventTable, error) {
+	idx := visibleIndices(t)
+	tid := make([]any, len(t.Timestamps))
+	inTxn := false
+	txnNum := 0
+	for _, i := range idx {
+		if !inTxn {
+			started, err := evalBool(s.Start, t.RowAt(i), "transaction start")
+			if err != nil {
+				return nil, err
+			}
+			if !started {
+				t.Mask[i] = false
+				continue
+			}
+			inTxn = true
+			txnNum++
+		}
+		tid[i] = fmt.Sprintf("%d", txnNum)
+		ended, err := evalBool(s.End, t.RowAt(i), "transaction end")
+		if err != nil {
+			return nil, err
+		}
+		if ended {
+			inTxn = false
+		}
+	}
+	t.Columns["transactionID"] = tid
+	return t, nil
+}
+
+func evalBool(e Expr, row Row, what string) (bool, error) {
+	v, err := e.Eval(row)
+	if err != nil {
+		return false, err
+	}
+	b, ok := v.(bool)
+	if !ok {
+		return false, fmt.Errorf("%s expression did not evaluate to a boolean", what)
+	}
+	return b, nil
 }
 
 // --- ranges ---

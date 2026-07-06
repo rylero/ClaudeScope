@@ -85,12 +85,16 @@ func (p *parser) parseStage() (Stage, error) {
 		return p.parseEval()
 	case "rex":
 		return p.parseRex()
+	case "timechart":
+		return p.parseTimechart()
 	case "ranges":
 		p.pos++
 		return &RangesStage{}, nil
+	case "transaction":
+		return p.parseTransaction()
 	default:
 		return nil, fmt.Errorf(
-			"unsupported command %q — this is a subset of Splunk SPL. Supported: where (or search), eval, rex, stats, table (or fields), sort, head, tail, ranges",
+			"unsupported command %q — this is a subset of Splunk SPL. Supported: where (or search), eval, rex, stats, timechart, table (or fields), sort, head, tail, and the ClaudeScope extensions ranges, transaction",
 			t.text)
 	}
 }
@@ -311,8 +315,10 @@ var validAggFns = map[string]bool{
 	"median": true, "stdev": true, "p50": true, "p90": true, "p99": true,
 }
 
-func (p *parser) parseStats() (Stage, error) {
-	p.pos++ // consume 'stats'
+// parseAggCallList parses `agg_call (',' agg_call)*` (comma optional; SPL also
+// allows plain spaces), stopping as soon as the next token isn't a known
+// aggregate function name. Shared by `stats` and `timechart`.
+func (p *parser) parseAggCallList() ([]AggCall, error) {
 	var aggs []AggCall
 	for {
 		agg, err := p.parseAggCall()
@@ -320,14 +326,22 @@ func (p *parser) parseStats() (Stage, error) {
 			return nil, err
 		}
 		aggs = append(aggs, agg)
-		if p.cur().kind == tComma { // comma optional; SPL also allows spaces
+		if p.cur().kind == tComma {
 			p.pos++
 		}
-		// Continue only if another aggregate function follows (not `by`/EOF/pipe).
 		if p.cur().kind == tIdent && validAggFns[strings.ToLower(p.cur().text)] {
 			continue
 		}
 		break
+	}
+	return aggs, nil
+}
+
+func (p *parser) parseStats() (Stage, error) {
+	p.pos++ // consume 'stats'
+	aggs, err := p.parseAggCallList()
+	if err != nil {
+		return nil, err
 	}
 	var groupBy []string
 	if p.cur().kind == tIdent && strings.EqualFold(p.cur().text, "by") {
@@ -487,6 +501,110 @@ func (p *parser) parseRex() (Stage, error) {
 		return nil, fmt.Errorf("rex regular expression must define at least one named group, e.g. (?<channel>\\d+)")
 	}
 	return &RexStage{Field: canonField(fld.text), Re: re, Groups: groups}, nil
+}
+
+// --- timechart / transaction ---
+
+// parseDuration parses a NUMBER followed by an optional unit ident
+// (us, ms, s, m, h, d — default s), returning microseconds. Adjacent tokens
+// like "1s" or "500ms" lex as NUMBER then IDENT with no gap to bridge.
+func (p *parser) parseDuration() (int64, error) {
+	if p.cur().kind != tNumber {
+		return 0, fmt.Errorf("expected a duration, e.g. span=1s")
+	}
+	n := p.cur().num
+	p.pos++
+	unit := "s"
+	if p.cur().kind == tIdent {
+		unit = strings.ToLower(p.cur().text)
+		p.pos++
+	}
+	var mult float64
+	switch unit {
+	case "us", "µs":
+		mult = 1
+	case "ms":
+		mult = 1_000
+	case "s":
+		mult = 1_000_000
+	case "m":
+		mult = 60_000_000
+	case "h":
+		mult = 3_600_000_000
+	case "d":
+		mult = 86_400_000_000
+	default:
+		return 0, fmt.Errorf("unknown duration unit %q (expected us, ms, s, m, h, or d)", unit)
+	}
+	return int64(n * mult), nil
+}
+
+func (p *parser) parseTimechart() (Stage, error) {
+	p.pos++ // consume 'timechart'
+	kw := p.cur()
+	if kw.kind != tIdent || !strings.EqualFold(kw.text, "span") {
+		return nil, fmt.Errorf("timechart requires span=<duration>, e.g. timechart span=1s avg(field)")
+	}
+	p.pos++
+	if p.cur().kind != tEQ {
+		return nil, fmt.Errorf("expected '=' after 'span'")
+	}
+	p.pos++
+	spanUs, err := p.parseDuration()
+	if err != nil {
+		return nil, err
+	}
+	aggs, err := p.parseAggCallList()
+	if err != nil {
+		return nil, err
+	}
+	var groupBy string
+	if p.cur().kind == tIdent && strings.EqualFold(p.cur().text, "by") {
+		p.pos++
+		f := p.cur()
+		if f.kind != tIdent {
+			return nil, fmt.Errorf("expected field name after 'by'")
+		}
+		groupBy = canonField(f.text)
+		p.pos++
+	}
+	return &TimechartStage{SpanUs: spanUs, Aggs: aggs, GroupBy: groupBy}, nil
+}
+
+// parseTransaction is a ClaudeScope extension (SPL's `transaction` has quite
+// different, field-correlation-based semantics): `transaction start=<expr>
+// end=<expr>` groups rows into episodes bounded by the two predicates.
+func (p *parser) parseTransaction() (Stage, error) {
+	p.pos++ // consume 'transaction'
+	var startExpr, endExpr Expr
+	for i := 0; i < 2; i++ {
+		kw := p.cur()
+		key := strings.ToLower(kw.text)
+		if kw.kind != tIdent || (key != "start" && key != "end") {
+			return nil, fmt.Errorf("transaction requires start=<expr> and end=<expr>, got %q", kw.text)
+		}
+		p.pos++
+		if p.cur().kind != tEQ {
+			return nil, fmt.Errorf("expected '=' after %q in transaction", key)
+		}
+		p.pos++
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if key == "start" {
+			if startExpr != nil {
+				return nil, fmt.Errorf("duplicate 'start' in transaction")
+			}
+			startExpr = e
+		} else {
+			if endExpr != nil {
+				return nil, fmt.Errorf("duplicate 'end' in transaction")
+			}
+			endExpr = e
+		}
+	}
+	return &TransactionStage{Start: startExpr, End: endExpr}, nil
 }
 
 func (p *parser) parseHeadTail(tail bool) (Stage, error) {
