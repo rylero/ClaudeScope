@@ -2,8 +2,12 @@ package cli
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -199,5 +203,183 @@ func TestRunCommand_Set(t *testing.T) {
 	_, err := RunCommand([]string{"set", "/key=1.0", "--session", "abc"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunCommand_SearchFields(t *testing.T) {
+	serveFake(t, map[string]any{
+		"/info": map[string]any{"fields": []map[string]string{
+			{"key": "/drive/leftVoltage", "type": "double"},
+			{"key": "/drive/rightVoltage", "type": "double"},
+			{"key": "/arm/angle", "type": "double"},
+		}, "start": 0, "end": 3000},
+	})
+	out, err := RunCommand([]string{"search-fields", "voltage", "--session", "abc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp struct {
+		Fields []struct {
+			Key string `json:"key"`
+		} `json:"fields"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Fields) != 2 {
+		t.Fatalf("expected 2 matches, got %d: %+v", len(resp.Fields), resp.Fields)
+	}
+}
+
+func TestRunCommand_SearchFields_CaseInsensitiveNoMatch(t *testing.T) {
+	serveFake(t, map[string]any{
+		"/info": map[string]any{"fields": []map[string]string{
+			{"key": "/arm/Angle", "type": "double"},
+		}, "start": 0, "end": 3000},
+	})
+	out, err := RunCommand([]string{"search-fields", "ANGLE", "--session", "abc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp struct {
+		Fields []map[string]string `json:"fields"`
+	}
+	json.Unmarshal(out, &resp)
+	if len(resp.Fields) != 1 {
+		t.Fatalf("expected case-insensitive match, got %+v", resp.Fields)
+	}
+
+	out, err = RunCommand([]string{"search-fields", "nonexistent", "--session", "abc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	json.Unmarshal(out, &resp)
+	if len(resp.Fields) != 0 {
+		t.Fatalf("expected no matches, got %+v", resp.Fields)
+	}
+}
+
+func TestRunCommand_SearchFields_NoArg(t *testing.T) {
+	if _, err := RunCommand([]string{"search-fields"}); err == nil {
+		t.Fatal("expected error when substring is omitted")
+	}
+}
+
+func TestResolveLiveSessionID_RejectsLogSession(t *testing.T) {
+	serveFake(t, map[string]any{
+		"/sessions": map[string]any{"sessions": []map[string]any{
+			{"id": "abc", "type": "log", "label": "/logs/a.wpilog", "idle_seconds": 3},
+		}},
+	})
+	if _, err := resolveLiveSessionID("abc"); err == nil {
+		t.Fatal("expected error for log session")
+	}
+}
+
+func TestResolveLiveSessionID_DefaultsToSoleSession(t *testing.T) {
+	serveFake(t, map[string]any{
+		"/sessions": map[string]any{"sessions": []map[string]any{
+			{"id": "abc", "type": "live", "label": "10.0.0.2", "idle_seconds": 0},
+		}},
+	})
+	id, err := resolveLiveSessionID("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "abc" {
+		t.Errorf("expected abc, got %q", id)
+	}
+}
+
+func TestResolveLiveSessionID_Ambiguous(t *testing.T) {
+	serveFake(t, map[string]any{
+		"/sessions": map[string]any{"sessions": []map[string]any{
+			{"id": "abc", "type": "live", "label": "10.0.0.2", "idle_seconds": 0},
+			{"id": "def", "type": "live", "label": "10.0.0.3", "idle_seconds": 0},
+		}},
+	})
+	if _, err := resolveLiveSessionID(""); err == nil {
+		t.Fatal("expected ambiguous-session error")
+	}
+}
+
+func TestResolveLiveSessionID_NoSessions(t *testing.T) {
+	serveFake(t, map[string]any{"/sessions": map[string]any{"sessions": []map[string]any{}}})
+	if _, err := resolveLiveSessionID(""); err == nil {
+		t.Fatal("expected no-session error")
+	}
+}
+
+func TestRunCommand_Query_FollowRejectsLogSession(t *testing.T) {
+	serveFake(t, map[string]any{
+		"/sessions": map[string]any{"sessions": []map[string]any{
+			{"id": "abc", "type": "log", "label": "/logs/a.wpilog", "idle_seconds": 0},
+		}},
+	})
+	_, err := RunCommand([]string{"query", "table", "--session", "abc", "--follow", "true"})
+	if err == nil {
+		t.Fatal("expected error when --follow is used against a log session")
+	}
+}
+
+// TestRunQueryFollow_StreamsChangedResults exercises the actual follow loop:
+// it stubs /query to return a fresh value on each call and expects one NDJSON
+// line per distinct result on stdout, until the server starts erroring
+// (standing in for the daemon/session going away), which is what makes the
+// otherwise-infinite loop return.
+func TestRunQueryFollow_StreamsChangedResults(t *testing.T) {
+	var calls int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sessions", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"sessions": []map[string]any{
+			{"id": "abc", "type": "live", "label": "10.0.0.2", "idle_seconds": 0},
+		}})
+	})
+	mux.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		switch {
+		case n <= 2:
+			// Same result twice in a row: should only print once.
+			json.NewEncoder(w).Encode(map[string]any{"result": []map[string]any{{"Timestamp": 1, "v": 1}}})
+		case n == 3:
+			json.NewEncoder(w).Encode(map[string]any{"result": []map[string]any{{"Timestamp": 2, "v": 2}}})
+		default:
+			http.Error(w, `{"error":"session not found","code":"SESSION_NOT_FOUND"}`, http.StatusNotFound)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	patchAddr(t, srv.URL)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStdout := os.Stdout
+	os.Stdout = w
+	t.Cleanup(func() { os.Stdout = oldStdout })
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- runQueryFollow("abc", "table", 1) }()
+
+	err = <-errCh
+	w.Close()
+	os.Stdout = oldStdout
+	if err == nil {
+		t.Fatal("expected runQueryFollow to return an error once the server starts failing")
+	}
+
+	out, _ := io.ReadAll(r)
+	var lines []string
+	for _, l := range strings.Split(string(out), "\n") {
+		if strings.TrimSpace(l) != "" {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 distinct-result lines, got %d: %q", len(lines), out)
+	}
+	if !strings.Contains(lines[0], `"v":1`) || !strings.Contains(lines[1], `"v":2`) {
+		t.Errorf("unexpected line contents: %q", lines)
 	}
 }

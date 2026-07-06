@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Version is set at build time via -ldflags.
@@ -28,6 +31,8 @@ func RunCommand(args []string) ([]byte, error) {
 		return runSessions(args[1:])
 	case "info":
 		return runInfo(args[1:])
+	case "search-fields":
+		return runSearchFields(args[1:])
 	case "get":
 		return runGet(args[1:])
 	case "range":
@@ -131,6 +136,42 @@ func runInfo(args []string) ([]byte, error) {
 	return DoRequest(http.MethodGet, "/info?session="+id, nil)
 }
 
+// runSearchFields filters the session's field list (from the existing /info
+// endpoint) by a case-insensitive substring match, done client-side since
+// /info already returns the full list and field counts don't warrant a
+// server-side fuzzy-match endpoint.
+func runSearchFields(args []string) ([]byte, error) {
+	pos, flags := parseFlags(args)
+	if len(pos) < 1 {
+		return nil, fmt.Errorf("usage: search-fields <substr> --session <id>")
+	}
+	id := flags["session"]
+	data, err := DoRequest(http.MethodGet, "/info?session="+id, nil)
+	if err != nil {
+		return nil, err
+	}
+	var info struct {
+		Fields []struct {
+			Key  string `json:"key"`
+			Type string `json:"type"`
+		} `json:"fields"`
+	}
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, fmt.Errorf("parse info response: %w", err)
+	}
+	substr := strings.ToLower(pos[0])
+	matches := make([]struct {
+		Key  string `json:"key"`
+		Type string `json:"type"`
+	}, 0)
+	for _, f := range info.Fields {
+		if strings.Contains(strings.ToLower(f.Key), substr) {
+			matches = append(matches, f)
+		}
+	}
+	return json.Marshal(map[string]any{"fields": matches})
+}
+
 func runGet(args []string) ([]byte, error) {
 	pos, flags := parseFlags(args)
 	if len(pos) < 1 {
@@ -222,15 +263,102 @@ func runStats(args []string) ([]byte, error) {
 func runQuery(args []string) ([]byte, error) {
 	pos, flags := parseFlags(args)
 	if len(pos) < 1 {
-		return nil, fmt.Errorf(`usage: query "<pipe string>" --session <id> [--start <us>] [--end <us>]`)
+		return nil, fmt.Errorf(`usage: query "<pipe string>" --session <id> [--start <us>] [--end <us>] [--follow true] [--interval-ms <n>]`)
 	}
 	id := flags["session"]
+	if flagBool(flags, "follow") {
+		return nil, runQueryFollow(id, pos[0], flagInt64(flags, "interval-ms", 500))
+	}
 	return DoRequest(http.MethodPost, "/query", map[string]any{
 		"session_id": id,
 		"query":      pos[0],
 		"start":      flagInt64(flags, "start", 0),
 		"end":        flagInt64(flags, "end", 0),
 	})
+}
+
+// runQueryFollow re-runs the query against the full live range on an
+// interval, printing one NDJSON line to stdout per changed result so a
+// long-running consumer (e.g. a Python dashboard) can tail stdout instead of
+// re-polling the daemon itself. It re-evaluates the whole pipeline each tick
+// rather than incrementally, so stats/timechart aggregations stay correct
+// over the growing window; it only writes a line when the result actually
+// changed, to avoid spamming an idle stream. It never returns except on
+// error (e.g. daemon lost, session disconnected) — the process is expected
+// to run until the caller kills it, like `tail -f`.
+func runQueryFollow(sessionID, q string, intervalMs int64) error {
+	if intervalMs <= 0 {
+		intervalMs = 500
+	}
+	resolvedID, err := resolveLiveSessionID(sessionID)
+	if err != nil {
+		return err
+	}
+	var last []byte
+	for {
+		result, err := DoRequest(http.MethodPost, "/query", map[string]any{
+			"session_id": resolvedID,
+			"query":      q,
+			"start":      int64(0),
+			"end":        int64(0),
+		})
+		if err != nil {
+			return err
+		}
+		// The daemon's JSON encoder already appends a trailing newline; trim
+		// it so each NDJSON line has exactly one, not a blank line between
+		// records (some strict line-based JSON readers choke on those).
+		result = bytes.TrimRight(result, "\n")
+		if !bytes.Equal(result, last) {
+			os.Stdout.Write(result)
+			os.Stdout.Write([]byte("\n"))
+			last = append(last[:0], result...)
+		}
+		time.Sleep(time.Duration(intervalMs) * time.Millisecond)
+	}
+}
+
+// resolveLiveSessionID mirrors the daemon's default-session resolution
+// (empty id => sole active session) and rejects log sessions, since
+// --follow only makes sense against a live NT session whose time range
+// keeps growing; a log session would just repeat the same result forever.
+func resolveLiveSessionID(id string) (string, error) {
+	data, err := DoRequest(http.MethodGet, "/sessions", nil)
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Sessions []struct {
+			ID   string `json:"id"`
+			Type string `json:"type"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return "", fmt.Errorf("parse sessions response: %w", err)
+	}
+	if id == "" {
+		switch len(resp.Sessions) {
+		case 0:
+			return "", fmt.Errorf("no active session; run 'load <file>' or 'connect <ip>' first")
+		case 1:
+			id = resp.Sessions[0].ID
+		default:
+			ids := make([]string, len(resp.Sessions))
+			for i, s := range resp.Sessions {
+				ids[i] = s.ID
+			}
+			return "", fmt.Errorf("multiple active sessions (%s); specify --session <id>", strings.Join(ids, ", "))
+		}
+	}
+	for _, s := range resp.Sessions {
+		if s.ID == id {
+			if s.Type != "live" {
+				return "", fmt.Errorf("--follow requires a live session (got type %q); log sessions have a fixed end", s.Type)
+			}
+			return id, nil
+		}
+	}
+	return "", fmt.Errorf("session not found: %s", id)
 }
 
 func runQueryMulti(args []string) ([]byte, error) {
@@ -293,6 +421,7 @@ func runHelp() ([]byte, error) {
 			"On Git Bash/MSYS2, set MSYS_NO_PATHCONV=1 before keys that start with '/'.",
 			"--session is optional when exactly one session is active; it defaults to that session. With multiple sessions, an AMBIGUOUS_SESSION error lists the IDs.",
 			"Global flag: append --out <file> to any command to write its output to a file instead of stdout.",
+			"query --follow true ignores --out: it streams NDJSON (one JSON object per line) directly to stdout and runs until killed, rather than returning once.",
 			"Workflow: load → query (--session optional) → disconnect when done.",
 		},
 		Commands: []cmd{
@@ -330,6 +459,16 @@ func runHelp() ([]byte, error) {
 				Usage:   "ClaudeScope info --session <id>",
 				Params:  []param{{Name: "--session", Type: "string", Required: false, Desc: "Session ID; optional when exactly one session is active"}},
 				Returns: `{"fields":[{"key":"...","type":"..."}],"start":<us>,"end":<us>}`,
+			},
+			{
+				Name:  "search-fields",
+				Desc:  "Case-insensitive substring search over a session's field list (filters the same data 'info' returns). Useful when writing SPL queries against a log with hundreds of NT keys.",
+				Usage: "ClaudeScope search-fields <substr> --session <id>",
+				Params: []param{
+					{Name: "substr", Type: "string", Required: true, Desc: "Substring to match against field keys, case-insensitive"},
+					{Name: "--session", Type: "string", Required: false, Desc: "Session ID; optional when exactly one session is active"},
+				},
+				Returns: `{"fields":[{"key":"...","type":"..."},...]}`,
 			},
 			{
 				Name:  "get",
@@ -392,14 +531,16 @@ func runHelp() ([]byte, error) {
 			{
 				Name:  "query",
 				Desc:  "Run a pipe query joining multiple fields on a shared, forward-filled timestamp axis. This is a SUBSET OF SPLUNK SPL: write standard SPL and it works. Supported: where (alias: search), eval <name> = <expr>, rex field=<field> \"<regex>\", stats <agg>(<field>) [as <alias>] [by <field>...], timechart span=<duration> <agg>(<field>)... [by <field>], lookup \"<path>.csv\" <field> output <col> [as <alias>][, ...] (CSV must have a header row; joins on <field> against a same-named CSV column), table (alias: fields), sort [-]<field>, head N, tail N, and the ClaudeScope-only extensions 'ranges' (must be last; collapses matching rows into [{start,end}] intervals) and 'transaction start=<expr> end=<expr>' (groups rows into episodes bounded by the two predicates, stamping a transactionID column; rows outside any episode are dropped). Aggregates: avg,min,max,sum,count,median,stdev,p50,p90,p99. timechart span units: us,ms,s,m,h,d (e.g. span=500ms, span=1m). eval operators: + - * / and functions abs,round,sqrt,ceil,floor,min,max,pow (put spaces around operators). rex uses (?<name>...) named groups. Comparison ops: > < >= <= == (= also works) != and or NOT. '_time' aliases the Timestamp column. Backtick-quoted `name` references expand named macros from ~/.claudescope/macros.json (flat JSON: name -> pipe-query text). NOT SUPPORTED (errors): dedup, subsearches, join.",
-				Usage: `ClaudeScope query "<pipe string>" --session <id> [--start <us>] [--end <us>]`,
+				Usage: `ClaudeScope query "<pipe string>" --session <id> [--start <us>] [--end <us>] [--follow true] [--interval-ms <n>]`,
 				Params: []param{
 					{Name: "query", Type: "string", Required: true, Desc: `SPL-subset pipe query, e.g. "where CurrentA > 40 and CurrentB > 40 | stats avg(BatteryVoltage) by Subsystem"`},
 					{Name: "--session", Type: "string", Required: false, Desc: "Session ID; optional when exactly one session is active"},
-					{Name: "--start", Type: "int64", Required: false, Desc: "Start µs; 0=beginning; negative=offset from end"},
-					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log; negative=offset from end"},
+					{Name: "--start", Type: "int64", Required: false, Desc: "Start µs; 0=beginning; negative=offset from end. Ignored when --follow true (always runs 0 to now)."},
+					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log; negative=offset from end. Ignored when --follow true."},
+					{Name: "--follow", Type: "bool", Required: false, Desc: "Must be spelled out (--follow true). Re-runs the query against a live session on an interval, printing one NDJSON line to stdout per changed result instead of returning once. Runs until killed; only valid for live (connect) sessions, not loaded logs."},
+					{Name: "--interval-ms", Type: "int64", Required: false, Desc: "Poll interval in milliseconds when --follow true. Default 500."},
 				},
-				Returns: `{"result":[{"Timestamp":<us>,"<field>":<value>,...},...]} or {"result":[{"start":<us>,"end":<us>},...]} when the pipeline ends in 'ranges'`,
+				Returns: `{"result":[{"Timestamp":<us>,"<field>":<value>,...},...]} or {"result":[{"start":<us>,"end":<us>},...]} when the pipeline ends in 'ranges'. With --follow true, one such JSON object per line (NDJSON) on stdout instead of a single response.`,
 			},
 			{
 				Name:  "query-multi",
