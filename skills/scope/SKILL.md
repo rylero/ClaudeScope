@@ -74,6 +74,12 @@ ClaudeScope info --session <id>
 ```
 Returns: `{"fields":[...],"start":<µs>,"end":<µs>}`
 
+### Search field names
+```bash
+ClaudeScope search-fields voltage --session <id>
+```
+Case-insensitive substring match over the same field list `info` returns — useful before writing a query against a log with hundreds of NT keys instead of scrolling through the full `info` output. Returns: `{"fields":[{"key":"...","type":"..."},...]}`
+
 ### Get value at timestamp (time=0 → latest)
 ```bash
 MSYS_NO_PATHCONV=1 ClaudeScope get /RealOutputs/Superstructure/State --session <id> --time 1500000
@@ -161,6 +167,22 @@ MSYS_NO_PATHCONV=1 ClaudeScope query 'lookup "canids.csv" CANID output Subsystem
 MSYS_NO_PATHCONV=1 ClaudeScope query '`brownout`' --session <id>
 ```
 
+**Output format:** `query` and `query-multi --union true` accept `--format csv` or `--format parquet` (default is JSON) so results can be loaded straight into `pandas` without hand-parsing:
+```bash
+MSYS_NO_PATHCONV=1 ClaudeScope query "stats avg(BatteryVoltage) by Subsystem" --session <id> --format parquet --out result.parquet
+```
+```python
+import pandas as pd
+df = pd.read_parquet("result.parquet")  # or pd.read_csv("result.csv") for --format csv
+```
+Parquet preserves native bool/float64/string types and true nulls for missing columns (e.g. `stats ... by` output where different groups produce different aggregate columns); CSV must stringify everything, though booleans are written as `True`/`False` so `pandas.read_csv` still infers `bool` dtype. Prefer Parquet for large results or when a column mixes numeric and missing values. If you're working in Python, prefer the **Python client** below over `--format` — it builds a DataFrame directly and skips the file round-trip.
+
+**Live streaming:** add `--follow true` (only valid for a `connect`-ed live session, not a loaded log) to re-run the query on an interval against a live session and stream one NDJSON line to stdout per *changed* result, instead of returning once:
+```bash
+MSYS_NO_PATHCONV=1 ClaudeScope query "stats avg(BatteryVoltage)" --session <id> --follow true --interval-ms 500
+```
+This runs until killed (like `tail -f`) — don't invoke it from a context expecting a single bounded response; it's meant for a long-running consumer tailing stdout. `--follow` ignores `--start`/`--end` (always evaluates 0-to-now) and is incompatible with `--format` (streamed output is always NDJSON) and `--out`.
+
 ### Query across multiple sessions
 
 `query-multi` runs the same query against several loaded sessions at once — e.g. every qualification match log from an event — instead of looping `query` manually. Load all the logs first (each `load` returns its own `session_id`; use `sessions` to list them).
@@ -177,6 +199,7 @@ MSYS_NO_PATHCONV=1 ClaudeScope query-multi "where BatteryVoltage < 7 | ranges" -
 - `--all true` or `--sessions id1,id2,...` — exactly one is required. Booleans must be spelled out (`--all true`, `--union true`) — bare `--all` is not recognized.
 - Default (comparison mode): `{"results":[{"session_id":"...","label":"...","result":...},...]}` — one entry per session, each session's own execution error (e.g. a field missing from that particular log) reported in that entry instead of failing the whole batch.
 - `--union true`: `{"result":[{"session_id":"...",...},...],"errors":[...]}` — successful rows flattened into one table tagged with `session_id`; errored sessions listed separately under `errors`, not silently dropped.
+- `--format csv`/`--format parquet` also work here, but only combined with `--union true` — comparison mode's per-session shape isn't row-shaped and errors out otherwise.
 
 ### Set NT value (live sessions only)
 ```bash
@@ -193,6 +216,21 @@ MSYS_NO_PATHCONV=1 ClaudeScope set /SmartDashboard/SetSpeed=2.5 --session <id>
 ```bash
 ClaudeScope help
 ```
+
+---
+
+## Python client (`claudescope-py`)
+
+If the task is "run a query and hand it to pandas" in Python, prefer the `claudescope` package (`ClaudeScope/python/`) over shelling out to the CLI and parsing `--format csv`/`--format parquet` output yourself — it wraps the same CLI binary and returns a `pandas.DataFrame` directly:
+
+```python
+import claudescope as scope
+
+with scope.load("/path/to/log.wpilog") as session:
+    df = session.query("stats avg(BatteryVoltage) by Subsystem")
+```
+
+Covers `load`/`connect`/`sessions`/`disconnect`, `query`/`query_multi` (→ `DataFrame`, or `dict[session_id, DataFrame | ClaudeScopeError]` in comparison mode), and `get`/`range`/`find_bool`/`find_threshold`/`stats`/`set`. Requires the `ClaudeScope` binary on `PATH` (or `CLAUDESCOPE_BIN` set). Failures raise `claudescope.ClaudeScopeError` with `.code`, not a raw subprocess error. See `ClaudeScope/python/README.md` for the full API and design notes.
 
 ---
 
