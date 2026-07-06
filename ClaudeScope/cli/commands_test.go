@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/parquet-go/parquet-go"
 )
 
 func serveFake(t *testing.T, responses map[string]any) {
@@ -381,5 +384,169 @@ func TestRunQueryFollow_StreamsChangedResults(t *testing.T) {
 	}
 	if !strings.Contains(lines[0], `"v":1`) || !strings.Contains(lines[1], `"v":2`) {
 		t.Errorf("unexpected line contents: %q", lines)
+	}
+}
+
+func TestRunCommand_Query_CSV(t *testing.T) {
+	serveFake(t, map[string]any{"/query": map[string]any{
+		"result": []map[string]any{
+			{"Timestamp": 100, "BatteryVoltage": 12.1, "Subsystem": "drive"},
+			{"Timestamp": 200, "BatteryVoltage": 11.9, "Subsystem": "arm"},
+		},
+	}})
+	out, err := RunCommand([]string{"query", "table Timestamp, BatteryVoltage, Subsystem", "--session", "abc", "--format", "csv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Timestamp,BatteryVoltage,Subsystem\n100,12.1,drive\n200,11.9,arm\n"
+	if string(out) != want {
+		t.Errorf("expected %q, got %q", want, string(out))
+	}
+}
+
+func TestRunCommand_Query_CSV_HeterogeneousColumns(t *testing.T) {
+	serveFake(t, map[string]any{"/query": map[string]any{
+		"result": []map[string]any{
+			{"Timestamp": 100, "A": 1},
+			{"Timestamp": 200, "B": 2},
+		},
+	}})
+	out, err := RunCommand([]string{"query", "stats avg(A) by B", "--session", "abc", "--format", "csv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Timestamp,A,B\n100,1,\n200,,2\n"
+	if string(out) != want {
+		t.Errorf("expected %q, got %q", want, string(out))
+	}
+}
+
+func TestRunCommand_Query_UnknownFormat(t *testing.T) {
+	serveFake(t, map[string]any{"/query": map[string]any{"result": []map[string]any{}}})
+	_, err := RunCommand([]string{"query", "table Timestamp", "--session", "abc", "--format", "xml"})
+	if err == nil {
+		t.Fatal("expected error for unsupported --format")
+	}
+}
+
+func TestRunCommand_QueryMulti_CSVRequiresUnion(t *testing.T) {
+	_, err := RunCommand([]string{"query-multi", "table Timestamp", "--all", "true", "--format", "csv"})
+	if err == nil {
+		t.Fatal("expected error when --format csv is used without --union true")
+	}
+}
+
+func TestRunCommand_QueryMulti_ParquetRequiresUnion(t *testing.T) {
+	_, err := RunCommand([]string{"query-multi", "table Timestamp", "--all", "true", "--format", "parquet"})
+	if err == nil {
+		t.Fatal("expected error when --format parquet is used without --union true")
+	}
+}
+
+func TestRunCommand_Query_CSV_BoolFormattedForPandas(t *testing.T) {
+	serveFake(t, map[string]any{"/query": map[string]any{
+		"result": []map[string]any{
+			{"Timestamp": 100, "Enabled": true},
+			{"Timestamp": 200, "Enabled": false},
+		},
+	}})
+	out, err := RunCommand([]string{"query", "table Timestamp, Enabled", "--session", "abc", "--format", "csv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Timestamp,Enabled\n100,True\n200,False\n"
+	if string(out) != want {
+		t.Errorf("expected %q, got %q", want, string(out))
+	}
+}
+
+func TestRunCommand_Query_Parquet_RoundTrip(t *testing.T) {
+	serveFake(t, map[string]any{"/query": map[string]any{
+		"result": []map[string]any{
+			{"Timestamp": 100.0, "BatteryVoltage": 12.1, "Enabled": true, "Subsystem": "drive"},
+			{"Timestamp": 200.0, "Enabled": false},
+		},
+	}})
+	out, err := RunCommand([]string{"query", "table Timestamp, BatteryVoltage, Enabled, Subsystem", "--session", "abc", "--format", "parquet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := parquet.OpenFile(bytes.NewReader(out), int64(len(out)))
+	if err != nil {
+		t.Fatalf("output is not a valid parquet file: %v", err)
+	}
+	r := parquet.NewGenericReader[map[string]any](bytes.NewReader(out), f.Schema())
+	rows := make([]map[string]any, 2)
+	for i := range rows {
+		rows[i] = map[string]any{}
+	}
+	n, err := r.Read(rows)
+	if n != 2 {
+		t.Fatalf("expected 2 rows, got %d (err=%v)", n, err)
+	}
+
+	if v, ok := rows[0]["Enabled"].(bool); !ok || v != true {
+		t.Errorf("row 0 Enabled: expected bool true, got %#v", rows[0]["Enabled"])
+	}
+	if v, ok := rows[0]["BatteryVoltage"].(float64); !ok || v != 12.1 {
+		t.Errorf("row 0 BatteryVoltage: expected float64 12.1, got %#v", rows[0]["BatteryVoltage"])
+	}
+	if v, ok := rows[0]["Subsystem"].(string); !ok || v != "drive" {
+		t.Errorf("row 0 Subsystem: expected string drive, got %#v", rows[0]["Subsystem"])
+	}
+	// Row 1 omits BatteryVoltage/Subsystem entirely -- must round-trip as
+	// Parquet nulls, not zero values or empty strings.
+	if rows[1]["BatteryVoltage"] != nil {
+		t.Errorf("row 1 BatteryVoltage: expected nil, got %#v", rows[1]["BatteryVoltage"])
+	}
+	if rows[1]["Subsystem"] != nil {
+		t.Errorf("row 1 Subsystem: expected nil, got %#v", rows[1]["Subsystem"])
+	}
+}
+
+// TestRunCommand_Query_Parquet_PreservesFalsyValues guards against a real
+// bug found via end-to-end testing: parquet-go's reflect-based map writer
+// (the plain w.Write([]map[string]any{...}) path) treats any Go zero value
+// -- false, 0.0, "" -- as equivalent to an absent key when the column is
+// Optional, so a legitimate "Enabled: false" or "Current: 0.0" reading was
+// silently coming back as a Parquet null. rowsToParquet must build rows
+// manually (parquet.Row with explicit definition levels) to avoid that path.
+func TestRunCommand_Query_Parquet_PreservesFalsyValues(t *testing.T) {
+	serveFake(t, map[string]any{"/query": map[string]any{
+		"result": []map[string]any{
+			{"Timestamp": 0.0, "Enabled": false, "Current": 0.0, "Label": ""},
+			{"Timestamp": 1000.0, "Enabled": true, "Current": 5.0, "Label": "ok"},
+		},
+	}})
+	out, err := RunCommand([]string{"query", "table Timestamp, Enabled, Current, Label", "--session", "abc", "--format", "parquet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := parquet.OpenFile(bytes.NewReader(out), int64(len(out)))
+	if err != nil {
+		t.Fatalf("output is not a valid parquet file: %v", err)
+	}
+	r := parquet.NewGenericReader[map[string]any](bytes.NewReader(out), f.Schema())
+	rows := make([]map[string]any, 2)
+	for i := range rows {
+		rows[i] = map[string]any{}
+	}
+	if n, err := r.Read(rows); n != 2 {
+		t.Fatalf("expected 2 rows, got %d (err=%v)", n, err)
+	}
+
+	if v, ok := rows[0]["Timestamp"].(float64); !ok || v != 0.0 {
+		t.Errorf("row 0 Timestamp: expected float64 0.0 (not null), got %#v", rows[0]["Timestamp"])
+	}
+	if v, ok := rows[0]["Enabled"].(bool); !ok || v != false {
+		t.Errorf("row 0 Enabled: expected bool false (not null), got %#v", rows[0]["Enabled"])
+	}
+	if v, ok := rows[0]["Current"].(float64); !ok || v != 0.0 {
+		t.Errorf("row 0 Current: expected float64 0.0 (not null), got %#v", rows[0]["Current"])
+	}
+	if v, ok := rows[0]["Label"].(string); !ok || v != "" {
+		t.Errorf("row 0 Label: expected empty string (not null), got %#v", rows[0]["Label"])
 	}
 }
