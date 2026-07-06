@@ -449,6 +449,114 @@ func TestMacroCycleDetected(t *testing.T) {
 	}
 }
 
+func TestRunAcrossReturnsOneResultPerSession(t *testing.T) {
+	sessions := map[string]session.DataSession{
+		"a": buildScaledTestLog(1),
+		"b": buildScaledTestLog(2), // CurrentA/B doubled
+	}
+	results, err := query.RunAcross(sessions, "stats avg(CurrentA)", 0, 0)
+	if err != nil {
+		t.Fatalf("RunAcross: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	byID := map[string]query.SessionResult{}
+	for _, r := range results {
+		byID[r.SessionID] = r
+	}
+	avgA := byID["a"].Result.([]map[string]any)[0]["avg(CurrentA)"].(float64)
+	avgB := byID["b"].Result.([]map[string]any)[0]["avg(CurrentA)"].(float64)
+	if avgB != avgA*2 {
+		t.Errorf("expected session b's avg to be double session a's (got a=%v b=%v)", avgA, avgB)
+	}
+}
+
+func TestRunAcrossParseErrorFailsFast(t *testing.T) {
+	sessions := map[string]session.DataSession{"a": buildTestLog()}
+	_, err := query.RunAcross(sessions, "bogus stage", 0, 0)
+	if err == nil {
+		t.Fatal("expected a parse error before any session is queried")
+	}
+}
+
+func TestRunAcrossPerSessionErrorIsIsolated(t *testing.T) {
+	empty, err := session.ParseWPILog(emptyWPILogBytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := map[string]session.DataSession{
+		"good": buildTestLog(),
+		"bad":  empty, // has no CurrentA field at all
+	}
+	results, err := query.RunAcross(sessions, "stats avg(CurrentA)", 0, 0)
+	if err != nil {
+		t.Fatalf("RunAcross: %v", err)
+	}
+	byID := map[string]query.SessionResult{}
+	for _, r := range results {
+		byID[r.SessionID] = r
+	}
+	if byID["good"].Error != "" {
+		t.Errorf("expected 'good' session to succeed, got error: %s", byID["good"].Error)
+	}
+	if byID["bad"].Error == "" {
+		t.Error("expected 'bad' session (missing CurrentA field) to report its own error")
+	}
+}
+
+func TestUnionResultsTagsSessionID(t *testing.T) {
+	sessions := map[string]session.DataSession{
+		"a": buildScaledTestLog(1),
+		"b": buildScaledTestLog(2),
+	}
+	results, err := query.RunAcross(sessions, "where CurrentA > 40 and CurrentB > 40 | ranges", 0, 0)
+	if err != nil {
+		t.Fatalf("RunAcross: %v", err)
+	}
+	rows, errored, err := query.UnionResults(results)
+	if err != nil {
+		t.Fatalf("UnionResults: %v", err)
+	}
+	if len(errored) != 0 {
+		t.Fatalf("unexpected errored sessions: %+v", errored)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 union rows (1 range per session), got %d: %+v", len(rows), rows)
+	}
+	seen := map[string]bool{}
+	for _, row := range rows {
+		id, ok := row["session_id"].(string)
+		if !ok || id == "" {
+			t.Errorf("row missing session_id: %+v", row)
+		}
+		seen[id] = true
+		if _, ok := row["start"]; !ok {
+			t.Errorf("union'd ranges row missing 'start': %+v", row)
+		}
+	}
+	if !seen["a"] || !seen["b"] {
+		t.Errorf("expected rows from both sessions, saw %v", seen)
+	}
+}
+
+func TestUnionResultsSeparatesErrors(t *testing.T) {
+	results := []query.SessionResult{
+		{SessionID: "ok", Result: []map[string]any{{"Timestamp": int64(0)}}},
+		{SessionID: "broken", Error: "some failure"},
+	}
+	rows, errored, err := query.UnionResults(results)
+	if err != nil {
+		t.Fatalf("UnionResults: %v", err)
+	}
+	if len(rows) != 1 || rows[0]["session_id"] != "ok" {
+		t.Errorf("expected 1 successful row tagged 'ok', got %+v", rows)
+	}
+	if len(errored) != 1 || errored[0].SessionID != "broken" {
+		t.Errorf("expected the broken session reported separately, got %+v", errored)
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	cases := []string{
 		"",

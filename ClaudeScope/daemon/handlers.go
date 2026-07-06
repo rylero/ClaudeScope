@@ -87,6 +87,15 @@ type queryRequest struct {
 	End       int64  `json:"end"`
 }
 
+type queryMultiRequest struct {
+	SessionIDs []string `json:"session_ids"`
+	All        bool     `json:"all"`
+	Query      string   `json:"query"`
+	Start      int64    `json:"start"`
+	End        int64    `json:"end"`
+	Union      bool     `json:"union"`
+}
+
 // --- helpers ---
 
 func writeError(w http.ResponseWriter, status int, msg, code string) {
@@ -357,6 +366,65 @@ func HandleQuery(reg *Registry) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, map[string]any{"result": result})
+	}
+}
+
+// HandleQueryMulti runs a pipe query across several sessions at once (see
+// query.RunAcross), for correlating data across e.g. every match log from an
+// event. By default returns one result per session (comparison mode); with
+// union=true, successful results are flattened into a single table tagged
+// with each row's source session_id.
+func HandleQueryMulti(reg *Registry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req queryMultiRequest
+		if err := decodeBody(r, &req); err != nil || req.Query == "" {
+			writeError(w, http.StatusBadRequest, "missing query field", "BAD_REQUEST")
+			return
+		}
+
+		var sessions map[string]session.DataSession
+		if req.All {
+			sessions = reg.All()
+			if len(sessions) == 0 {
+				writeError(w, http.StatusNotFound, ErrNoSession.Error(), "NO_SESSION")
+				return
+			}
+		} else {
+			if len(req.SessionIDs) == 0 {
+				writeError(w, http.StatusBadRequest, "provide session_ids or set all=true", "BAD_REQUEST")
+				return
+			}
+			sessions = make(map[string]session.DataSession, len(req.SessionIDs))
+			for _, id := range req.SessionIDs {
+				sess, err := reg.Get(id)
+				if err != nil {
+					sessionNotFound(w, id)
+					return
+				}
+				sessions[id] = sess
+			}
+		}
+
+		results, err := query.RunAcross(sessions, req.Query, req.Start, req.End)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "QUERY_ERROR")
+			return
+		}
+		labels := reg.Labels()
+		for i := range results {
+			results[i].Label = labels[results[i].SessionID]
+		}
+
+		if req.Union {
+			rows, errored, err := query.UnionResults(results)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error(), "QUERY_ERROR")
+				return
+			}
+			writeJSON(w, map[string]any{"result": rows, "errors": errored})
+			return
+		}
+		writeJSON(w, map[string]any{"results": results})
 	}
 }
 
