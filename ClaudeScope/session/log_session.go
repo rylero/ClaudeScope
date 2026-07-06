@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"sort"
+	"strconv"
 )
 
 // wpilogSession holds all data parsed from a .wpilog file.
@@ -483,6 +484,15 @@ func ToFloat64(v any) (float64, error) {
 		return float64(val), nil
 	case int:
 		return float64(val), nil
+	case string:
+		// lookup-joined CSV columns (and any other string-typed field) are
+		// always strings even when their contents are numeric, so coerce
+		// rather than reject — matches how Splunk treats extracted string
+		// fields in eval/stats.
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return f, nil
+		}
+		return 0, fmt.Errorf("not a numeric value: %q", val)
 	default:
 		return 0, fmt.Errorf("not a numeric value: %T", v)
 	}
