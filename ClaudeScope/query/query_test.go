@@ -147,12 +147,105 @@ func TestSPLSpaceSeparatedAndTimeAlias(t *testing.T) {
 }
 
 func TestUnsupportedCommandError(t *testing.T) {
-	_, err := query.Parse("where CurrentA > 40 | eval x = CurrentA - CurrentB")
+	_, err := query.Parse("where CurrentA > 40 | timechart span=1s avg(CurrentA)")
 	if err == nil {
-		t.Fatal("expected error for unsupported 'eval' command")
+		t.Fatal("expected error for unsupported 'timechart' command")
 	}
 	if !strings.Contains(err.Error(), "subset of Splunk SPL") {
 		t.Errorf("error should point the user at the supported SPL subset, got: %v", err)
+	}
+}
+
+func TestEvalArithmetic(t *testing.T) {
+	sess := buildTestLog()
+	// At t=2000: CurrentA=45, CurrentB=55 -> delta = -10, abs = 10.
+	res, err := query.Run(sess, "eval delta = abs(CurrentA - CurrentB) | where _time == 2000 | table delta", 0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rows := res.([]map[string]any)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %+v", len(rows), rows)
+	}
+	if rows[0]["delta"].(float64) != 10 {
+		t.Errorf("expected delta=10, got %v", rows[0]["delta"])
+	}
+}
+
+func TestEvalThenWhereUsesComputedColumn(t *testing.T) {
+	sess := buildTestLog()
+	// sum = CurrentA + CurrentB; keep rows where sum > 90. Only t=2000 (45+55=100).
+	res, err := query.Run(sess, "eval sum = CurrentA + CurrentB | where sum > 90 | table _time sum", 0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rows := res.([]map[string]any)
+	if len(rows) != 1 || rows[0]["Timestamp"] != int64(2000) || rows[0]["sum"].(float64) != 100 {
+		t.Errorf("expected single row t=2000 sum=100, got %+v", rows)
+	}
+}
+
+func TestEvalDivisionAndPathsCoexist(t *testing.T) {
+	sess := buildTestLog()
+	// Division operator must not collide with FRC field-path '/'. ratio at
+	// t=1000: 50/20 = 2.5.
+	res, err := query.Run(sess, "eval ratio = CurrentA / CurrentB | where _time == 1000 | table ratio", 0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rows := res.([]map[string]any)
+	if len(rows) != 1 || rows[0]["ratio"].(float64) != 2.5 {
+		t.Errorf("expected ratio=2.5, got %+v", rows)
+	}
+}
+
+func TestRexExtractsNamedGroup(t *testing.T) {
+	sess := buildTestLog()
+	// SPL-style (?<ch>...) named group, forward-filled: ch=3 until t=3000, then 7.
+	res, err := query.Run(sess, `rex field=Message "channel (?<ch>\d+)" | table _time ch`, 0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rows := res.([]map[string]any)
+	if len(rows) == 0 {
+		t.Fatal("expected rows")
+	}
+	first, last := rows[0], rows[len(rows)-1]
+	if first["ch"] != "3" {
+		t.Errorf("expected first ch=3, got %v", first["ch"])
+	}
+	if last["ch"] != "7" {
+		t.Errorf("expected last ch=7, got %v", last["ch"])
+	}
+}
+
+func TestSlashPathFieldWithDivision(t *testing.T) {
+	sess := buildTestLog()
+	// `/PDH/Voltage` is a slash-path field; `/ 2` in the same query is division.
+	// At t=0: /PDH/Voltage=12 -> half=6.
+	res, err := query.Run(sess, "eval half = /PDH/Voltage / 2 | where _time == 0 | table half", 0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rows := res.([]map[string]any)
+	if len(rows) != 1 || rows[0]["half"].(float64) != 6 {
+		t.Errorf("expected half=6, got %+v", rows)
+	}
+}
+
+func TestSlashPathFieldInWhere(t *testing.T) {
+	sess := buildTestLog()
+	res, err := query.Run(sess, "where /PDH/Voltage < 7 | ranges", 0, 0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got := res.([]session.TimeRange)
+	want, err := sess.FindThresholdRanges("/PDH/Voltage", -1e18, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) || (len(want) > 0 && got[0] != want[0]) {
+		t.Errorf("slash-path where|ranges got %+v, want %+v", got, want)
 	}
 }
 

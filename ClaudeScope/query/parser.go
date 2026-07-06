@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -80,19 +81,32 @@ func (p *parser) parseStage() (Stage, error) {
 		return p.parseHeadTail(false)
 	case "tail":
 		return p.parseHeadTail(true)
+	case "eval":
+		return p.parseEval()
+	case "rex":
+		return p.parseRex()
 	case "ranges":
 		p.pos++
 		return &RangesStage{}, nil
 	default:
 		return nil, fmt.Errorf(
-			"unsupported command %q — this is a subset of Splunk SPL. Supported: where (or search), stats, table (or fields), sort, head, tail, ranges",
+			"unsupported command %q — this is a subset of Splunk SPL. Supported: where (or search), eval, rex, stats, table (or fields), sort, head, tail, ranges",
 			t.text)
 	}
 }
 
-// --- expr: or_expr := and_expr ('or' and_expr)*
-//     and_expr := cmp ('and' cmp)*
-//     cmp      := primary OP primary | '(' expr ')'
+// Expression grammar (precedence low → high):
+//   or    := and ('or' and)*
+//   and   := cmp ('and' cmp)*
+//   cmp   := ('NOT'|'!') cmp | add (OP add)?      // comparison is optional so a
+//                                                 // bare arithmetic value is valid
+//   add   := mul (('+'|'-') mul)*
+//   mul   := unary (('*'|'/') unary)*
+//   unary := '-' unary | primary
+//   primary := NUMBER | STRING | 'true' | 'false'
+//            | IDENT '(' args ')'   (function call)
+//            | IDENT                (field ref)
+//            | '(' or ')'
 
 func (p *parser) parseExpr() (Expr, error) { return p.parseOr() }
 
@@ -138,32 +152,76 @@ func (p *parser) parseCmp() (Expr, error) {
 		}
 		return &NotExpr{Inner: inner}, nil
 	}
-	if p.cur().kind == tLParen {
+	left, err := p.parseAdd()
+	if err != nil {
+		return nil, err
+	}
+	// The comparison is optional: `eval d = a - b` has no comparison operator.
+	if op, ok := cmpOp(p.cur().kind); ok {
 		p.pos++
-		e, err := p.parseExpr()
+		right, err := p.parseAdd()
 		if err != nil {
 			return nil, err
 		}
-		if p.cur().kind != tRParen {
-			return nil, fmt.Errorf("expected ')'")
+		return &BinaryExpr{Op: op, Left: left, Right: right}, nil
+	}
+	return left, nil
+}
+
+func (p *parser) parseAdd() (Expr, error) {
+	left, err := p.parseMul()
+	if err != nil {
+		return nil, err
+	}
+	for p.cur().kind == tPlus || p.cur().kind == tMinus {
+		op := "+"
+		if p.cur().kind == tMinus {
+			op = "-"
 		}
 		p.pos++
-		return e, nil
+		right, err := p.parseMul()
+		if err != nil {
+			return nil, err
+		}
+		left = &BinaryExpr{Op: op, Left: left, Right: right}
 	}
-	left, err := p.parsePrimary()
+	return left, nil
+}
+
+func (p *parser) parseMul() (Expr, error) {
+	left, err := p.parseUnary()
 	if err != nil {
 		return nil, err
 	}
-	op, ok := cmpOp(p.cur().kind)
-	if !ok {
-		return nil, fmt.Errorf("expected comparison operator, got %q", p.cur().text)
+	for p.cur().kind == tStar || p.cur().kind == tSlash {
+		op := "*"
+		if p.cur().kind == tSlash {
+			op = "/"
+		}
+		p.pos++
+		right, err := p.parseUnary()
+		if err != nil {
+			return nil, err
+		}
+		left = &BinaryExpr{Op: op, Left: left, Right: right}
 	}
-	p.pos++
-	right, err := p.parsePrimary()
-	if err != nil {
-		return nil, err
+	return left, nil
+}
+
+func (p *parser) parseUnary() (Expr, error) {
+	if p.cur().kind == tMinus {
+		p.pos++
+		inner, err := p.parseUnary()
+		if err != nil {
+			return nil, err
+		}
+		// Fold a leading minus on a literal; otherwise 0 - inner.
+		if n, ok := inner.(*NumberLit); ok {
+			return &NumberLit{Value: -n.Value}, nil
+		}
+		return &BinaryExpr{Op: "-", Left: &NumberLit{Value: 0}, Right: inner}, nil
 	}
-	return &BinaryExpr{Op: op, Left: left, Right: right}, nil
+	return p.parsePrimary()
 }
 
 func cmpOp(k tokKind) (string, bool) {
@@ -187,14 +245,17 @@ func cmpOp(k tokKind) (string, bool) {
 func (p *parser) parsePrimary() (Expr, error) {
 	t := p.cur()
 	switch t.kind {
-	case tMinus:
+	case tLParen:
 		p.pos++
-		n := p.cur()
-		if n.kind != tNumber {
-			return nil, fmt.Errorf("expected number after '-'")
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if p.cur().kind != tRParen {
+			return nil, fmt.Errorf("expected ')'")
 		}
 		p.pos++
-		return &NumberLit{Value: -n.num}, nil
+		return e, nil
 	case tNumber:
 		p.pos++
 		return &NumberLit{Value: t.num}, nil
@@ -203,6 +264,10 @@ func (p *parser) parsePrimary() (Expr, error) {
 		return &StringLit{Value: t.text}, nil
 	case tIdent:
 		p.pos++
+		// Function call: IDENT immediately followed by '('.
+		if p.cur().kind == tLParen {
+			return p.parseFuncArgs(strings.ToLower(t.text))
+		}
 		if strings.EqualFold(t.text, "true") {
 			return &BoolLit{Value: true}, nil
 		}
@@ -212,6 +277,31 @@ func (p *parser) parsePrimary() (Expr, error) {
 		return &FieldRef{Name: canonField(t.text)}, nil
 	}
 	return nil, fmt.Errorf("unexpected token %q", t.text)
+}
+
+// parseFuncArgs parses `( expr (',' expr)* )` after a function name.
+func (p *parser) parseFuncArgs(name string) (Expr, error) {
+	p.pos++ // consume '('
+	var args []Expr
+	if p.cur().kind != tRParen {
+		for {
+			a, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, a)
+			if p.cur().kind == tComma {
+				p.pos++
+				continue
+			}
+			break
+		}
+	}
+	if p.cur().kind != tRParen {
+		return nil, fmt.Errorf("expected ')' to close %s(", name)
+	}
+	p.pos++
+	return &FuncExpr{Name: name, Args: args}, nil
 }
 
 // --- stats stage ---
@@ -336,6 +426,67 @@ func (p *parser) parseSort() (Stage, error) {
 	}
 	p.pos++
 	return &SortStage{Field: canonField(f.text), Desc: desc}, nil
+}
+
+// --- eval / rex ---
+
+func (p *parser) parseEval() (Stage, error) {
+	p.pos++ // consume 'eval'
+	name := p.cur()
+	if name.kind != tIdent {
+		return nil, fmt.Errorf("expected a column name after 'eval'")
+	}
+	p.pos++
+	if p.cur().kind != tEQ {
+		return nil, fmt.Errorf("expected '=' in eval assignment: eval <name> = <expr>")
+	}
+	p.pos++
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	return &EvalStage{Target: canonField(name.text), Expr: expr}, nil
+}
+
+func (p *parser) parseRex() (Stage, error) {
+	p.pos++ // consume 'rex'
+	// SPL syntax: rex field=<field> "<regex with named groups>"
+	kw := p.cur()
+	if kw.kind != tIdent || !strings.EqualFold(kw.text, "field") {
+		return nil, fmt.Errorf(`rex requires: rex field=<field> "<regex>"`)
+	}
+	p.pos++
+	if p.cur().kind != tEQ {
+		return nil, fmt.Errorf("expected '=' after 'field' in rex")
+	}
+	p.pos++
+	fld := p.cur()
+	if fld.kind != tIdent {
+		return nil, fmt.Errorf("expected a field name after 'field=' in rex")
+	}
+	p.pos++
+	pat := p.cur()
+	if pat.kind != tString {
+		return nil, fmt.Errorf("rex requires a quoted regular expression")
+	}
+	p.pos++
+	// Accept Splunk/PCRE named-group syntax `(?<name>...)` by translating it to
+	// Go's `(?P<name>...)`.
+	goPat := strings.ReplaceAll(pat.text, "(?<", "(?P<")
+	re, err := regexp.Compile(goPat)
+	if err != nil {
+		return nil, fmt.Errorf("invalid rex regular expression: %w", err)
+	}
+	var groups []string
+	for _, name := range re.SubexpNames() {
+		if name != "" {
+			groups = append(groups, name)
+		}
+	}
+	if len(groups) == 0 {
+		return nil, fmt.Errorf("rex regular expression must define at least one named group, e.g. (?<channel>\\d+)")
+	}
+	return &RexStage{Field: canonField(fld.text), Re: re, Groups: groups}, nil
 }
 
 func (p *parser) parseHeadTail(tail bool) (Stage, error) {

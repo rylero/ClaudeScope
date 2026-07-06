@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 
 	"github.com/rylero/TheFRCSuite/ClaudeScope/session"
@@ -13,6 +14,14 @@ import (
 type Stage interface {
 	CollectFields(out map[string]bool)
 	Exec(t *EventTable) (*EventTable, error)
+}
+
+// fieldProducer is implemented by stages that create new columns mid-pipeline
+// (eval, rex, stats). The pipeline uses this to distinguish real session
+// fields — which must be joined from the log — from computed columns produced
+// downstream, so it never asks the session for a name that eval/rex will make.
+type fieldProducer interface {
+	ProducedFields() []string
 }
 
 // --- where ---
@@ -37,6 +46,77 @@ func (s *WhereStage) Exec(t *EventTable) (*EventTable, error) {
 		if !b {
 			t.Mask[i] = false
 		}
+	}
+	return t, nil
+}
+
+// --- eval ---
+
+// EvalStage computes a scalar expression per row and stores it as a new (or
+// overwritten) column. It runs over every row, not just the visible ones, so a
+// later `ranges` stage still sees the full timestamp axis.
+type EvalStage struct {
+	Target string
+	Expr   Expr
+}
+
+func (s *EvalStage) CollectFields(out map[string]bool) { s.Expr.CollectFields(out) }
+func (s *EvalStage) ProducedFields() []string          { return []string{s.Target} }
+
+func (s *EvalStage) Exec(t *EventTable) (*EventTable, error) {
+	col := make([]any, len(t.Timestamps))
+	for i := range t.Timestamps {
+		v, err := s.Expr.Eval(t.RowAt(i))
+		if err != nil {
+			return nil, err
+		}
+		col[i] = v
+	}
+	t.Columns[s.Target] = col
+	return t, nil
+}
+
+// --- rex ---
+
+// RexStage applies a regular expression with named capture groups to a string
+// column, storing each group as a new column. Rows that do not match get nil
+// for the group columns.
+type RexStage struct {
+	Field  string
+	Re     *regexp.Regexp
+	Groups []string
+}
+
+func (s *RexStage) CollectFields(out map[string]bool) { out[s.Field] = true }
+func (s *RexStage) ProducedFields() []string          { return s.Groups }
+
+func (s *RexStage) Exec(t *EventTable) (*EventTable, error) {
+	src, ok := t.Columns[s.Field]
+	if !ok {
+		return nil, fmt.Errorf("unknown field: %s", s.Field)
+	}
+	cols := make(map[string][]any, len(s.Groups))
+	for _, g := range s.Groups {
+		cols[g] = make([]any, len(t.Timestamps))
+	}
+	names := s.Re.SubexpNames()
+	for i := range t.Timestamps {
+		if src[i] == nil {
+			continue
+		}
+		m := s.Re.FindStringSubmatch(fmt.Sprint(src[i]))
+		if m == nil {
+			continue
+		}
+		for gi, name := range names {
+			if name == "" {
+				continue
+			}
+			cols[name][i] = m[gi]
+		}
+	}
+	for g, c := range cols {
+		t.Columns[g] = c
 	}
 	return t, nil
 }
@@ -177,6 +257,18 @@ func (s *StatsStage) CollectFields(out map[string]bool) {
 	for _, f := range s.GroupBy {
 		out[f] = true
 	}
+}
+
+// ProducedFields reports the columns stats emits (aggregate aliases plus the
+// group-by keys) so a downstream stage referencing them isn't mistaken for a
+// session field.
+func (s *StatsStage) ProducedFields() []string {
+	out := make([]string, 0, len(s.Aggs)+len(s.GroupBy))
+	for _, a := range s.Aggs {
+		out = append(out, a.Alias)
+	}
+	out = append(out, s.GroupBy...)
+	return out
 }
 
 func (s *StatsStage) Exec(t *EventTable) (*EventTable, error) {
