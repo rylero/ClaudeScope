@@ -120,6 +120,32 @@ func (r *Registry) Resolve(id string) (session.DataSession, string, error) {
 	return nil, "", &AmbiguousSessionError{IDs: ids}
 }
 
+// All returns every active session keyed by ID, refreshing each one's
+// last-used time. Used by query-multi's "run across every session" mode.
+func (r *Registry) All() map[string]session.DataSession {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]session.DataSession, len(r.entries))
+	now := time.Now()
+	for id, e := range r.entries {
+		e.lastUsed = now
+		out[id] = e.sess
+	}
+	return out
+}
+
+// Labels returns id -> label for every active session, for annotating
+// cross-session query results with human-readable names.
+func (r *Registry) Labels() map[string]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]string, len(r.entries))
+	for id, e := range r.entries {
+		out[id] = e.label
+	}
+	return out
+}
+
 // Get returns the session for id, refreshing its last-used time.
 func (r *Registry) Get(id string) (session.DataSession, error) {
 	r.mu.Lock()

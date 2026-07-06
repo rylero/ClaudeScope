@@ -40,6 +40,8 @@ func RunCommand(args []string) ([]byte, error) {
 		return runStats(args[1:])
 	case "query":
 		return runQuery(args[1:])
+	case "query-multi":
+		return runQueryMulti(args[1:])
 	case "set":
 		return runSet(args[1:])
 	case "help":
@@ -75,6 +77,18 @@ func flagInt64(flags map[string]string, key string, defaultVal int64) int64 {
 		return defaultVal
 	}
 	return v
+}
+
+// flagBool requires an explicit value (--all true, not bare --all) so it
+// doesn't need special-casing in parseFlags, which always consumes the token
+// after a "--flag" as that flag's value.
+func flagBool(flags map[string]string, key string) bool {
+	v, ok := flags[key]
+	if !ok {
+		return false
+	}
+	b, _ := strconv.ParseBool(v)
+	return b
 }
 
 func flagFloat64(flags map[string]string, key string) (float64, error) {
@@ -216,6 +230,29 @@ func runQuery(args []string) ([]byte, error) {
 		"query":      pos[0],
 		"start":      flagInt64(flags, "start", 0),
 		"end":        flagInt64(flags, "end", 0),
+	})
+}
+
+func runQueryMulti(args []string) ([]byte, error) {
+	pos, flags := parseFlags(args)
+	if len(pos) < 1 {
+		return nil, fmt.Errorf(`usage: query-multi "<pipe string>" (--sessions id1,id2,... | --all true) [--union true] [--start <us>] [--end <us>]`)
+	}
+	all := flagBool(flags, "all")
+	var ids []string
+	if v, ok := flags["sessions"]; ok && v != "" {
+		ids = strings.Split(v, ",")
+	}
+	if !all && len(ids) == 0 {
+		return nil, fmt.Errorf("query-multi requires --sessions id1,id2,... or --all true")
+	}
+	return DoRequest(http.MethodPost, "/query-multi", map[string]any{
+		"session_ids": ids,
+		"all":         all,
+		"query":       pos[0],
+		"start":       flagInt64(flags, "start", 0),
+		"end":         flagInt64(flags, "end", 0),
+		"union":       flagBool(flags, "union"),
 	})
 }
 
@@ -363,6 +400,20 @@ func runHelp() ([]byte, error) {
 					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log; negative=offset from end"},
 				},
 				Returns: `{"result":[{"Timestamp":<us>,"<field>":<value>,...},...]} or {"result":[{"start":<us>,"end":<us>},...]} when the pipeline ends in 'ranges'`,
+			},
+			{
+				Name:  "query-multi",
+				Desc:  "Run the same query across several sessions at once (e.g. every match log from an event) and either compare or merge the results. Parses the query once, so one typo doesn't repeat N times; each session's own execution error (e.g. a field missing from that particular log) is reported per-session instead of aborting the whole batch. Comparison mode (default) returns one entry per session_id. Union mode (--union true) flattens every session's successful rows into one table tagged with a 'session_id' column (or 'session_id'/'start'/'end' rows if the query ends in 'ranges'); errored sessions are reported separately under 'errors' rather than silently dropped.",
+				Usage: `ClaudeScope query-multi "<pipe string>" (--sessions id1,id2,... | --all true) [--union true] [--start <us>] [--end <us>]`,
+				Params: []param{
+					{Name: "query", Type: "string", Required: true, Desc: "SPL-subset pipe query, same grammar as `query`"},
+					{Name: "--sessions", Type: "string", Required: false, Desc: "Comma-separated session IDs; required unless --all true"},
+					{Name: "--all", Type: "bool", Required: false, Desc: "Run against every currently active session instead of --sessions. Must be spelled out (--all true), not bare --all."},
+					{Name: "--union", Type: "bool", Required: false, Desc: "Flatten successful results into one session_id-tagged table instead of one entry per session. Must be spelled out (--union true)."},
+					{Name: "--start", Type: "int64", Required: false, Desc: "Start µs; 0=beginning; negative=offset from end"},
+					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log; negative=offset from end"},
+				},
+				Returns: `{"results":[{"session_id":"...","label":"...","result":...},...]} (comparison mode) or {"result":[{"session_id":"...",...},...],"errors":[...]} (union mode)`,
 			},
 			{
 				Name:  "set",

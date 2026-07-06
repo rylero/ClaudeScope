@@ -14,7 +14,12 @@ import (
 //   - "Enabled"  (boolean): true@0, false@2500
 //
 // so `CurrentA>40 and CurrentB>40` is true only in [2000,2500).
-func buildTestLog() session.DataSession {
+func buildTestLog() session.DataSession { return buildScaledTestLog(1) }
+
+// buildScaledTestLog is buildTestLog with CurrentA/CurrentB multiplied by
+// scale, so cross-session tests (RunAcross/UnionResults) can tell two
+// sessions' rows apart by value instead of just by session_id.
+func buildScaledTestLog(scale float64) session.DataSession {
 	var buf bytes.Buffer
 	buf.WriteString("WPILOG")
 	buf.Write([]byte{0x00, 0x01})
@@ -68,22 +73,22 @@ func buildTestLog() session.DataSession {
 	startField(4, "Message", "string")
 	startField(5, "/PDH/Voltage", "double") // slash-path field: division must not collide
 
-	writeRecord(1, 0, float64Bytes(10))
-	writeRecord(2, 0, float64Bytes(10))
+	writeRecord(1, 0, float64Bytes(10*scale))
+	writeRecord(2, 0, float64Bytes(10*scale))
 	writeRecord(3, 0, boolByte(true))
 	writeRecord(4, 0, []byte("Brownout on channel 3"))
 	writeRecord(5, 0, float64Bytes(12))
 
-	writeRecord(1, 1000, float64Bytes(50))
-	writeRecord(2, 1000, float64Bytes(20))
+	writeRecord(1, 1000, float64Bytes(50*scale))
+	writeRecord(2, 1000, float64Bytes(20*scale))
 
-	writeRecord(1, 2000, float64Bytes(45))
-	writeRecord(2, 2000, float64Bytes(55))
+	writeRecord(1, 2000, float64Bytes(45*scale))
+	writeRecord(2, 2000, float64Bytes(55*scale))
 
 	writeRecord(3, 2500, boolByte(false))
 
-	writeRecord(1, 3000, float64Bytes(5))
-	writeRecord(2, 3000, float64Bytes(5))
+	writeRecord(1, 3000, float64Bytes(5*scale))
+	writeRecord(2, 3000, float64Bytes(5*scale))
 	writeRecord(4, 3000, []byte("Brownout on channel 7"))
 	writeRecord(5, 3000, float64Bytes(6))
 
@@ -92,4 +97,17 @@ func buildTestLog() session.DataSession {
 		panic(err)
 	}
 	return sess
+}
+
+// emptyWPILogBytes is a structurally valid .wpilog with no fields and no data
+// records — used to exercise per-session query errors (e.g. a field that
+// doesn't exist in one particular session) without affecting other sessions.
+func emptyWPILogBytes() []byte {
+	var buf bytes.Buffer
+	buf.WriteString("WPILOG")
+	buf.Write([]byte{0x00, 0x01})
+	var extraLen [4]byte
+	binary.LittleEndian.PutUint32(extraLen[:], 0)
+	buf.Write(extraLen[:])
+	return buf.Bytes()
 }

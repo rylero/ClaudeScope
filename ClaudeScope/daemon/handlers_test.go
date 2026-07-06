@@ -190,3 +190,111 @@ func TestHandleSet_OnLogSession_ReturnsError(t *testing.T) {
 		t.Errorf("expected READ_ONLY_SESSION, got %q", errResp.Code)
 	}
 }
+
+func TestHandleQueryMulti_MissingQuery(t *testing.T) {
+	reg := &Registry{entries: make(map[string]*entry)}
+	handler := HandleQueryMulti(reg)
+	w := postJSON(t, handler, map[string]any{"all": true})
+	if w.Code == http.StatusOK {
+		t.Fatal("expected error for missing query")
+	}
+}
+
+func TestHandleQueryMulti_NoSessionsSpecified(t *testing.T) {
+	reg := &Registry{entries: make(map[string]*entry)}
+	handler := HandleQueryMulti(reg)
+	w := postJSON(t, handler, map[string]any{"query": "stats count"})
+	if w.Code == http.StatusOK {
+		t.Fatal("expected error when neither session_ids nor all is set")
+	}
+	var errResp errorResponse
+	json.NewDecoder(w.Body).Decode(&errResp)
+	if errResp.Code != "BAD_REQUEST" {
+		t.Errorf("expected BAD_REQUEST, got %q", errResp.Code)
+	}
+}
+
+func TestHandleQueryMulti_AllWithNoActiveSessions(t *testing.T) {
+	reg := &Registry{entries: make(map[string]*entry)}
+	handler := HandleQueryMulti(reg)
+	w := postJSON(t, handler, map[string]any{"query": "stats count", "all": true})
+	if w.Code == http.StatusOK {
+		t.Fatal("expected error when all=true but no sessions are active")
+	}
+	var errResp errorResponse
+	json.NewDecoder(w.Body).Decode(&errResp)
+	if errResp.Code != "NO_SESSION" {
+		t.Errorf("expected NO_SESSION, got %q", errResp.Code)
+	}
+}
+
+func TestHandleQueryMulti_UnknownSessionID(t *testing.T) {
+	reg, id, _ := testRegistry(t)
+	handler := HandleQueryMulti(reg)
+	w := postJSON(t, handler, map[string]any{
+		"query":       "stats count",
+		"session_ids": []string{id, "does-not-exist"},
+	})
+	if w.Code == http.StatusOK {
+		t.Fatal("expected error for an unresolvable session id")
+	}
+	var errResp errorResponse
+	json.NewDecoder(w.Body).Decode(&errResp)
+	if errResp.Code != "SESSION_NOT_FOUND" {
+		t.Errorf("expected SESSION_NOT_FOUND, got %q", errResp.Code)
+	}
+}
+
+func TestHandleQueryMulti_AllReturnsOneResultPerSession(t *testing.T) {
+	reg := &Registry{entries: make(map[string]*entry)}
+	reg.entries["s1"] = &entry{sess: &mockSession{}, label: "match1.wpilog"}
+	reg.entries["s2"] = &entry{sess: &mockSession{}, label: "match2.wpilog"}
+	handler := HandleQueryMulti(reg)
+	w := postJSON(t, handler, map[string]any{"query": "stats count", "all": true})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body)
+	}
+	var resp struct {
+		Results []struct {
+			SessionID string `json:"session_id"`
+			Label     string `json:"label"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Results) != 2 {
+		t.Fatalf("expected 2 results, got %d: %+v", len(resp.Results), resp.Results)
+	}
+	for _, r := range resp.Results {
+		if r.Label == "" {
+			t.Errorf("expected label to be populated for session %s", r.SessionID)
+		}
+	}
+}
+
+func TestHandleQueryMulti_UnionMode(t *testing.T) {
+	reg := &Registry{entries: make(map[string]*entry)}
+	reg.entries["s1"] = &entry{sess: &mockSession{}}
+	reg.entries["s2"] = &entry{sess: &mockSession{}}
+	handler := HandleQueryMulti(reg)
+	w := postJSON(t, handler, map[string]any{"query": "stats count", "all": true, "union": true})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body)
+	}
+	var resp struct {
+		Result []map[string]any `json:"result"`
+		Errors []map[string]any `json:"errors"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Result) != 2 {
+		t.Fatalf("expected 2 union rows (1 per session), got %d: %+v", len(resp.Result), resp.Result)
+	}
+	for _, row := range resp.Result {
+		if row["session_id"] == nil {
+			t.Errorf("union row missing session_id: %+v", row)
+		}
+	}
+}

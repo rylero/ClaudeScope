@@ -161,6 +161,23 @@ MSYS_NO_PATHCONV=1 ClaudeScope query 'lookup "canids.csv" CANID output Subsystem
 MSYS_NO_PATHCONV=1 ClaudeScope query '`brownout`' --session <id>
 ```
 
+### Query across multiple sessions
+
+`query-multi` runs the same query against several loaded sessions at once — e.g. every qualification match log from an event — instead of looping `query` manually. Load all the logs first (each `load` returns its own `session_id`; use `sessions` to list them).
+
+```bash
+# average auton battery sag across every currently loaded log
+MSYS_NO_PATHCONV=1 ClaudeScope query-multi "stats avg(BatteryVoltage), min(BatteryVoltage)" --all true
+# same, but only specific matches
+MSYS_NO_PATHCONV=1 ClaudeScope query-multi "stats avg(BatteryVoltage)" --sessions <id1>,<id2>,<id3>
+# flatten brownout intervals from every match into one session_id-tagged table
+MSYS_NO_PATHCONV=1 ClaudeScope query-multi "where BatteryVoltage < 7 | ranges" --all true --union true
+```
+
+- `--all true` or `--sessions id1,id2,...` — exactly one is required. Booleans must be spelled out (`--all true`, `--union true`) — bare `--all` is not recognized.
+- Default (comparison mode): `{"results":[{"session_id":"...","label":"...","result":...},...]}` — one entry per session, each session's own execution error (e.g. a field missing from that particular log) reported in that entry instead of failing the whole batch.
+- `--union true`: `{"result":[{"session_id":"...",...},...],"errors":[...]}` — successful rows flattened into one table tagged with `session_id`; errored sessions listed separately under `errors`, not silently dropped.
+
 ### Set NT value (live sessions only)
 ```bash
 MSYS_NO_PATHCONV=1 ClaudeScope set /SmartDashboard/SetSpeed=2.5 --session <id>
