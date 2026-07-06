@@ -23,6 +23,7 @@ const (
 	tLE
 	tEQ
 	tNE
+	tBang
 	tMinus
 	tEOF
 )
@@ -76,18 +77,21 @@ func lex(input string) ([]token, error) {
 				i++
 			}
 		case c == '=':
+			// SPL's `where` accepts both `=` and `==` as equality; we match that.
 			if i+1 < n && r[i+1] == '=' {
-				toks = append(toks, token{kind: tEQ})
 				i += 2
 			} else {
-				return nil, fmt.Errorf("unexpected '=' at position %d (did you mean '=='?)", i)
+				i++
 			}
+			toks = append(toks, token{kind: tEQ})
 		case c == '!':
 			if i+1 < n && r[i+1] == '=' {
 				toks = append(toks, token{kind: tNE})
 				i += 2
 			} else {
-				return nil, fmt.Errorf("unexpected '!' at position %d", i)
+				// Bare '!' is SPL-style boolean negation (equivalent to NOT).
+				toks = append(toks, token{kind: tBang})
+				i++
 			}
 		case c == '"' || c == '\'':
 			quote := c

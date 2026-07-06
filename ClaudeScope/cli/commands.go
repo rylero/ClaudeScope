@@ -354,10 +354,10 @@ func runHelp() ([]byte, error) {
 			},
 			{
 				Name:  "query",
-				Desc:  "Run a Splunk-style pipe query (where/stats/table/sort/head/tail/ranges) joining multiple fields on a shared, forward-filled timestamp axis.",
+				Desc:  "Run a pipe query joining multiple fields on a shared, forward-filled timestamp axis. This is a SUBSET OF SPLUNK SPL: write standard SPL and it works. Supported: where (alias: search), stats <agg>(<field>) [as <alias>] [by <field>...], table (alias: fields), sort [-]<field>, head N, tail N, and the ClaudeScope-only 'ranges' (must be last; collapses matching rows into [{start,end}] intervals). Aggregates: avg,min,max,sum,count,median,stdev,p50,p90,p99. Operators: > < >= <= == (= also works) != and or NOT. '_time' aliases the Timestamp column. NOT SUPPORTED (errors): eval, timechart, rex, dedup, subsearches, lookup, join, transaction.",
 				Usage: `ClaudeScope query "<pipe string>" --session <id> [--start <us>] [--end <us>]`,
 				Params: []param{
-					{Name: "query", Type: "string", Required: true, Desc: `Pipe query, e.g. "where CurrentA > 40 and CurrentB > 40 | stats avg(BatteryVoltage) by Subsystem"`},
+					{Name: "query", Type: "string", Required: true, Desc: `SPL-subset pipe query, e.g. "where CurrentA > 40 and CurrentB > 40 | stats avg(BatteryVoltage) by Subsystem"`},
 					{Name: "--session", Type: "string", Required: false, Desc: "Session ID; optional when exactly one session is active"},
 					{Name: "--start", Type: "int64", Required: false, Desc: "Start µs; 0=beginning; negative=offset from end"},
 					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log; negative=offset from end"},

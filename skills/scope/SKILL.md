@@ -111,6 +111,37 @@ MSYS_NO_PATHCONV=1 ClaudeScope stats /RealOutputs/Drive/LeftVelocity --session <
 ```
 Returns: `{"mean":<f>,"median":<f>,"min":<f>,"max":<f>,"q1":<f>,"q3":<f>,"avg_delta":<f/s>,"min_delta":<f/s>,"max_delta":<f/s>}`
 
+### Query (pipe language — a subset of Splunk SPL)
+
+`query` runs a pipe query that joins multiple fields onto one forward-filled timestamp axis — use it for **correlated, multi-field** questions that the single-field verbs above can't express (e.g. "when were *both* currents above 40 at the same time").
+
+**It is a strict subset of Splunk SPL — write standard SPL and it works.** Do not learn a new syntax; just stay inside the supported set below.
+
+```bash
+MSYS_NO_PATHCONV=1 ClaudeScope query "where CurrentA > 40 and CurrentB > 40 | stats avg(BatteryVoltage) by Subsystem" --session <id>
+```
+
+| Command | Notes |
+|---|---|
+| `where <expr>` (alias `search`) | `> < >= <= == != and or NOT`; `=` also accepted for equality |
+| `stats <agg>(<field>) [as <alias>] [by <field>...]` | aggs: `avg min max sum count median stdev p50 p90 p99` |
+| `table <field>...` (alias `fields`) | comma **or** space separated; `_time` = the Timestamp column |
+| `sort [-]<field>` | `-` prefix = descending |
+| `head N` / `tail N` | first/last N rows |
+| `ranges` | **ClaudeScope extension, not SPL.** Must be the last stage. Collapses matching rows into `[{start,end}]` intervals — the multi-field version of `find-bool`/`find-threshold`. |
+
+**Not supported (returns an error):** `eval`, `timechart`, `rex`, `dedup`, subsearches, `lookup`, `join`, `transaction`. If you need a computed column or time bucketing, fall back to `range` + client-side math for now.
+
+Returns: `{"result":[{"Timestamp":<µs>,"<field>":<value>,...},...]}`, or `{"result":[{"start":<µs>,"end":<µs>},...]}` when the pipeline ends in `ranges`.
+
+Examples:
+```bash
+# intervals where battery sagged below 7V (multi-field capable, unlike find-threshold)
+MSYS_NO_PATHCONV=1 ClaudeScope query "where BatteryVoltage < 7 | ranges" --session <id>
+# top 10 highest current samples
+MSYS_NO_PATHCONV=1 ClaudeScope query "table _time CurrentA | sort -CurrentA | head 10" --session <id>
+```
+
 ### Set NT value (live sessions only)
 ```bash
 MSYS_NO_PATHCONV=1 ClaudeScope set /SmartDashboard/SetSpeed=2.5 --session <id>

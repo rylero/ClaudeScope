@@ -35,6 +35,23 @@ type BoolLit struct{ Value bool }
 func (l *BoolLit) Eval(Row) (any, error)             { return l.Value, nil }
 func (l *BoolLit) CollectFields(out map[string]bool) {}
 
+// NotExpr is SPL-style boolean negation (`NOT expr` / `!expr`).
+type NotExpr struct{ Inner Expr }
+
+func (e *NotExpr) CollectFields(out map[string]bool) { e.Inner.CollectFields(out) }
+
+func (e *NotExpr) Eval(row Row) (any, error) {
+	v, err := e.Inner.Eval(row)
+	if err != nil {
+		return nil, err
+	}
+	b, ok := v.(bool)
+	if !ok {
+		return nil, fmt.Errorf("NOT operand did not evaluate to a boolean")
+	}
+	return !b, nil
+}
+
 // BinaryExpr covers both boolean combinators (and/or) and comparisons
 // (> < >= <= == !=).
 type BinaryExpr struct {

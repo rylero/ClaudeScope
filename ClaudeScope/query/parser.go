@@ -47,13 +47,23 @@ type parser struct {
 
 func (p *parser) cur() token { return p.toks[p.pos] }
 
+// canonField maps SPL-idiomatic field aliases onto ClaudeScope's canonical
+// names. `_time` is Splunk's timestamp field; we expose it as an alias for the
+// EventTable's `Timestamp` pseudo-column.
+func canonField(name string) string {
+	if name == "_time" {
+		return "Timestamp"
+	}
+	return name
+}
+
 func (p *parser) parseStage() (Stage, error) {
 	t := p.cur()
 	if t.kind != tIdent {
 		return nil, fmt.Errorf("expected stage keyword, got %q", t.text)
 	}
 	switch strings.ToLower(t.text) {
-	case "where":
+	case "where", "search": // `search` is the SPL alias for a leading filter
 		p.pos++
 		expr, err := p.parseExpr()
 		if err != nil {
@@ -62,7 +72,7 @@ func (p *parser) parseStage() (Stage, error) {
 		return &WhereStage{Expr: expr}, nil
 	case "stats":
 		return p.parseStats()
-	case "table":
+	case "table", "fields": // `fields` is the SPL alias for column selection
 		return p.parseTable()
 	case "sort":
 		return p.parseSort()
@@ -74,7 +84,9 @@ func (p *parser) parseStage() (Stage, error) {
 		p.pos++
 		return &RangesStage{}, nil
 	default:
-		return nil, fmt.Errorf("unknown stage %q", t.text)
+		return nil, fmt.Errorf(
+			"unsupported command %q — this is a subset of Splunk SPL. Supported: where (or search), stats, table (or fields), sort, head, tail, ranges",
+			t.text)
 	}
 }
 
@@ -117,6 +129,15 @@ func (p *parser) parseAnd() (Expr, error) {
 }
 
 func (p *parser) parseCmp() (Expr, error) {
+	// SPL-style negation: `NOT expr` or `!expr`.
+	if p.cur().kind == tBang || (p.cur().kind == tIdent && strings.EqualFold(p.cur().text, "not")) {
+		p.pos++
+		inner, err := p.parseCmp()
+		if err != nil {
+			return nil, err
+		}
+		return &NotExpr{Inner: inner}, nil
+	}
 	if p.cur().kind == tLParen {
 		p.pos++
 		e, err := p.parseExpr()
@@ -188,7 +209,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 		if strings.EqualFold(t.text, "false") {
 			return &BoolLit{Value: false}, nil
 		}
-		return &FieldRef{Name: t.text}, nil
+		return &FieldRef{Name: canonField(t.text)}, nil
 	}
 	return nil, fmt.Errorf("unexpected token %q", t.text)
 }
@@ -209,8 +230,11 @@ func (p *parser) parseStats() (Stage, error) {
 			return nil, err
 		}
 		aggs = append(aggs, agg)
-		if p.cur().kind == tComma {
+		if p.cur().kind == tComma { // comma optional; SPL also allows spaces
 			p.pos++
+		}
+		// Continue only if another aggregate function follows (not `by`/EOF/pipe).
+		if p.cur().kind == tIdent && validAggFns[strings.ToLower(p.cur().text)] {
 			continue
 		}
 		break
@@ -225,11 +249,12 @@ func (p *parser) parseStats() (Stage, error) {
 			}
 			groupBy = append(groupBy, f.text)
 			p.pos++
-			if p.cur().kind == tComma {
+			if p.cur().kind == tComma { // comma optional
 				p.pos++
-				continue
 			}
-			break
+			if p.cur().kind != tIdent {
+				break
+			}
 		}
 	}
 	return &StatsStage{Aggs: aggs, GroupBy: groupBy}, nil
@@ -286,13 +311,14 @@ func (p *parser) parseTable() (Stage, error) {
 		if f.kind != tIdent {
 			return nil, fmt.Errorf("expected field name")
 		}
-		fields = append(fields, f.text)
+		fields = append(fields, canonField(f.text))
 		p.pos++
-		if p.cur().kind == tComma {
+		if p.cur().kind == tComma { // comma is optional; SPL also allows spaces
 			p.pos++
-			continue
 		}
-		break
+		if p.cur().kind != tIdent {
+			break
+		}
 	}
 	return &TableStage{Fields: fields}, nil
 }
@@ -309,7 +335,7 @@ func (p *parser) parseSort() (Stage, error) {
 		return nil, fmt.Errorf("expected field name after 'sort'")
 	}
 	p.pos++
-	return &SortStage{Field: f.text, Desc: desc}, nil
+	return &SortStage{Field: canonField(f.text), Desc: desc}, nil
 }
 
 func (p *parser) parseHeadTail(tail bool) (Stage, error) {
