@@ -20,12 +20,28 @@ func Run(sess session.DataSession, queryStr string, start, end int64) (any, erro
 
 // Run executes an already-parsed pipeline.
 func (p *Pipeline) Run(sess session.DataSession, start, end int64) (any, error) {
-	fieldSet := map[string]bool{}
+	// Walk the stages in order, tracking which columns are produced mid-pipeline
+	// (by eval/rex/stats). A field is requested from the session only if it is
+	// referenced before any stage produces it — computed columns must not be
+	// looked up in the log.
+	produced := map[string]bool{"Timestamp": true}
+	needed := map[string]bool{}
 	for _, st := range p.Stages {
-		st.CollectFields(fieldSet)
+		refs := map[string]bool{}
+		st.CollectFields(refs)
+		for f := range refs {
+			if !produced[f] {
+				needed[f] = true
+			}
+		}
+		if fp, ok := st.(fieldProducer); ok {
+			for _, f := range fp.ProducedFields() {
+				produced[f] = true
+			}
+		}
 	}
-	fields := make([]string, 0, len(fieldSet))
-	for f := range fieldSet {
+	fields := make([]string, 0, len(needed))
+	for f := range needed {
 		fields = append(fields, f)
 	}
 	sort.Strings(fields)

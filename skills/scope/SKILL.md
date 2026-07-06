@@ -124,13 +124,15 @@ MSYS_NO_PATHCONV=1 ClaudeScope query "where CurrentA > 40 and CurrentB > 40 | st
 | Command | Notes |
 |---|---|
 | `where <expr>` (alias `search`) | `> < >= <= == != and or NOT`; `=` also accepted for equality |
+| `eval <name> = <expr>` | computed column; `+ - * /`, parens, functions `abs round sqrt ceil floor min max pow`. **Put spaces around operators** (`a - b`, not `a-b`) — field names may contain `-`/`/`. |
+| `rex field=<field> "<regex>"` | extract named groups from a string field into new columns; use `(?<name>...)` (SPL/PCRE syntax, auto-translated to Go's `(?P<name>...)`) |
 | `stats <agg>(<field>) [as <alias>] [by <field>...]` | aggs: `avg min max sum count median stdev p50 p90 p99` |
 | `table <field>...` (alias `fields`) | comma **or** space separated; `_time` = the Timestamp column |
 | `sort [-]<field>` | `-` prefix = descending |
 | `head N` / `tail N` | first/last N rows |
 | `ranges` | **ClaudeScope extension, not SPL.** Must be the last stage. Collapses matching rows into `[{start,end}]` intervals — the multi-field version of `find-bool`/`find-threshold`. |
 
-**Not supported (returns an error):** `eval`, `timechart`, `rex`, `dedup`, subsearches, `lookup`, `join`, `transaction`. If you need a computed column or time bucketing, fall back to `range` + client-side math for now.
+**Not supported (returns an error):** `timechart`, `dedup`, subsearches, `lookup`, `join`, `transaction`. For time bucketing, fall back to `range` + client-side math for now.
 
 Returns: `{"result":[{"Timestamp":<µs>,"<field>":<value>,...},...]}`, or `{"result":[{"start":<µs>,"end":<µs>},...]}` when the pipeline ends in `ranges`.
 
@@ -140,6 +142,10 @@ Examples:
 MSYS_NO_PATHCONV=1 ClaudeScope query "where BatteryVoltage < 7 | ranges" --session <id>
 # top 10 highest current samples
 MSYS_NO_PATHCONV=1 ClaudeScope query "table _time CurrentA | sort -CurrentA | head 10" --session <id>
+# computed column, then filter on it
+MSYS_NO_PATHCONV=1 ClaudeScope query "eval imbalance = abs(CurrentA - CurrentB) | where imbalance > 15 | ranges" --session <id>
+# extract channel numbers from driver-station messages and count them
+MSYS_NO_PATHCONV=1 ClaudeScope query 'rex field=/DriverStation/Message "channel (?<ch>\d+)" | stats count by ch' --session <id>
 ```
 
 ### Set NT value (live sessions only)

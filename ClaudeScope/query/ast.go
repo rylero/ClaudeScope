@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/rylero/TheFRCSuite/ClaudeScope/session"
 )
@@ -90,6 +91,36 @@ func (b *BinaryExpr) Eval(row Row) (any, error) {
 			return nil, fmt.Errorf("right side of %q did not evaluate to a boolean", b.Op)
 		}
 		return rb, nil
+	case "+", "-", "*", "/":
+		lv, err := b.Left.Eval(row)
+		if err != nil {
+			return nil, err
+		}
+		rv, err := b.Right.Eval(row)
+		if err != nil {
+			return nil, err
+		}
+		lf, err := session.ToFloat64(lv)
+		if err != nil {
+			return nil, fmt.Errorf("left side of %q is not numeric: %w", b.Op, err)
+		}
+		rf, err := session.ToFloat64(rv)
+		if err != nil {
+			return nil, fmt.Errorf("right side of %q is not numeric: %w", b.Op, err)
+		}
+		switch b.Op {
+		case "+":
+			return lf + rf, nil
+		case "-":
+			return lf - rf, nil
+		case "*":
+			return lf * rf, nil
+		default: // "/"
+			if rf == 0 {
+				return nil, fmt.Errorf("division by zero")
+			}
+			return lf / rf, nil
+		}
 	default:
 		lv, err := b.Left.Eval(row)
 		if err != nil {
@@ -100,6 +131,90 @@ func (b *BinaryExpr) Eval(row Row) (any, error) {
 			return nil, err
 		}
 		return compareValues(b.Op, lv, rv)
+	}
+}
+
+// FuncExpr is a scalar function call in an eval/where expression, e.g.
+// abs(CurrentA - CurrentB) or round(BatteryVoltage, 1).
+type FuncExpr struct {
+	Name string
+	Args []Expr
+}
+
+func (f *FuncExpr) CollectFields(out map[string]bool) {
+	for _, a := range f.Args {
+		a.CollectFields(out)
+	}
+}
+
+func (f *FuncExpr) Eval(row Row) (any, error) {
+	args := make([]float64, len(f.Args))
+	for i, a := range f.Args {
+		v, err := a.Eval(row)
+		if err != nil {
+			return nil, err
+		}
+		fv, err := session.ToFloat64(v)
+		if err != nil {
+			return nil, fmt.Errorf("argument %d of %s() is not numeric: %w", i+1, f.Name, err)
+		}
+		args[i] = fv
+	}
+	arity := func(want int) error {
+		if len(args) != want {
+			return fmt.Errorf("%s() takes %d argument(s), got %d", f.Name, want, len(args))
+		}
+		return nil
+	}
+	switch f.Name {
+	case "abs":
+		if err := arity(1); err != nil {
+			return nil, err
+		}
+		return math.Abs(args[0]), nil
+	case "sqrt":
+		if err := arity(1); err != nil {
+			return nil, err
+		}
+		return math.Sqrt(args[0]), nil
+	case "ceil":
+		if err := arity(1); err != nil {
+			return nil, err
+		}
+		return math.Ceil(args[0]), nil
+	case "floor":
+		if err := arity(1); err != nil {
+			return nil, err
+		}
+		return math.Floor(args[0]), nil
+	case "round":
+		switch len(args) {
+		case 1:
+			return math.Round(args[0]), nil
+		case 2:
+			p := math.Pow(10, args[1])
+			return math.Round(args[0]*p) / p, nil
+		default:
+			return nil, fmt.Errorf("round() takes 1 or 2 arguments, got %d", len(args))
+		}
+	case "pow":
+		if err := arity(2); err != nil {
+			return nil, err
+		}
+		return math.Pow(args[0], args[1]), nil
+	case "min", "max":
+		if len(args) == 0 {
+			return nil, fmt.Errorf("%s() needs at least one argument", f.Name)
+		}
+		res := args[0]
+		for _, v := range args[1:] {
+			if (f.Name == "min" && v < res) || (f.Name == "max" && v > res) {
+				res = v
+			}
+		}
+		return res, nil
+	default:
+		return nil, fmt.Errorf("unknown function %s()", f.Name)
 	}
 }
 

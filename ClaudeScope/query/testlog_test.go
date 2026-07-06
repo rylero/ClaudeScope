@@ -65,10 +65,14 @@ func buildTestLog() session.DataSession {
 	startField(1, "CurrentA", "double")
 	startField(2, "CurrentB", "double")
 	startField(3, "Enabled", "boolean")
+	startField(4, "Message", "string")
+	startField(5, "/PDH/Voltage", "double") // slash-path field: division must not collide
 
 	writeRecord(1, 0, float64Bytes(10))
 	writeRecord(2, 0, float64Bytes(10))
 	writeRecord(3, 0, boolByte(true))
+	writeRecord(4, 0, []byte("Brownout on channel 3"))
+	writeRecord(5, 0, float64Bytes(12))
 
 	writeRecord(1, 1000, float64Bytes(50))
 	writeRecord(2, 1000, float64Bytes(20))
@@ -80,6 +84,8 @@ func buildTestLog() session.DataSession {
 
 	writeRecord(1, 3000, float64Bytes(5))
 	writeRecord(2, 3000, float64Bytes(5))
+	writeRecord(4, 3000, []byte("Brownout on channel 7"))
+	writeRecord(5, 3000, float64Bytes(6))
 
 	sess, err := session.ParseWPILog(buf.Bytes())
 	if err != nil {

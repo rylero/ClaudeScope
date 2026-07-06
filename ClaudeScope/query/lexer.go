@@ -25,6 +25,9 @@ const (
 	tNE
 	tBang
 	tMinus
+	tPlus
+	tStar
+	tSlash
 	tEOF
 )
 
@@ -60,6 +63,28 @@ func lex(input string) ([]token, error) {
 		case c == '-':
 			toks = append(toks, token{kind: tMinus})
 			i++
+		case c == '+':
+			toks = append(toks, token{kind: tPlus})
+			i++
+		case c == '*':
+			toks = append(toks, token{kind: tStar})
+			i++
+		case c == '/':
+			// '/' begins an FRC field path (/RealOutputs/...) when the next
+			// character continues a path; otherwise it is the division
+			// operator. Field paths never contain spaces, so a spaced '/' is
+			// unambiguously division (eval requires spaces around operators).
+			if i+1 < n && (isIdentStart(r[i+1]) || unicode.IsDigit(r[i+1])) {
+				j := i
+				for j < n && isIdentPart(r[j]) {
+					j++
+				}
+				toks = append(toks, token{kind: tIdent, text: string(r[i:j])})
+				i = j
+			} else {
+				toks = append(toks, token{kind: tSlash})
+				i++
+			}
 		case c == '>':
 			if i+1 < n && r[i+1] == '=' {
 				toks = append(toks, token{kind: tGE})
