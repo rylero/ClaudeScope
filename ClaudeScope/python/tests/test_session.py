@@ -59,6 +59,49 @@ def test_query_empty_bytes_returns_empty_dataframe(monkeypatch):
     assert df.empty
 
 
+def test_range_df_long_format(monkeypatch):
+    def fake_invoke_bytes(args):
+        assert args == ["range", "/Drive/Vel", "--format", "parquet", "--session", "s1"]
+        return _parquet_bytes(
+            [
+                {"key": "/Drive/Vel", "timestamp": 100.0, "value": 1.5},
+                {"key": "/Drive/Vel", "timestamp": 200.0, "value": 2.5},
+            ]
+        )
+
+    monkeypatch.setattr(_cli, "invoke_bytes", fake_invoke_bytes)
+    session = scope.Session("s1", "log", "x.wpilog")
+    df = session.range_df("/Drive/Vel")
+    assert list(df.columns) == ["key", "timestamp", "value"]
+    assert df.iloc[1]["value"] == 2.5
+
+
+def test_range_df_pivot(monkeypatch):
+    def fake_invoke_bytes(args):
+        return _parquet_bytes(
+            [
+                {"key": "a", "timestamp": 100.0, "value": 1.0},
+                {"key": "b", "timestamp": 100.0, "value": 2.0},
+                {"key": "a", "timestamp": 200.0, "value": 3.0},
+            ]
+        )
+
+    monkeypatch.setattr(_cli, "invoke_bytes", fake_invoke_bytes)
+    session = scope.Session("s1", "log", "x.wpilog")
+    df = session.range_df("a", "b", pivot=True)
+    assert df.index.name == "timestamp"
+    assert set(df.columns) == {"a", "b"}
+    assert df.loc[100.0, "b"] == 2.0
+
+
+def test_range_df_empty(monkeypatch):
+    monkeypatch.setattr(_cli, "invoke_bytes", lambda args: b"")
+    session = scope.Session("s1", "log", "x.wpilog")
+    df = session.range_df("/Drive/Vel")
+    assert df.empty
+    assert list(df.columns) == ["key", "timestamp", "value"]
+
+
 def test_query_multi_union_attaches_errors(monkeypatch):
     def fake_invoke(args):
         return {

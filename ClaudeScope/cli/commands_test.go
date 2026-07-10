@@ -561,3 +561,52 @@ func TestRunCommand_Query_Parquet_PreservesFalsyValues(t *testing.T) {
 		t.Errorf("row 0 Label: expected empty string (not null), got %#v", rows[0]["Label"])
 	}
 }
+
+func TestRunCommand_Range_CSV(t *testing.T) {
+	serveFake(t, map[string]any{"/range": map[string]any{
+		"/Drive/Vel": []map[string]any{
+			{"timestamp": 100, "value": 1.5},
+			{"timestamp": 200, "value": 2.5},
+		},
+	}})
+	out, err := RunCommand([]string{"range", "/Drive/Vel", "--session", "abc", "--format", "csv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "key,timestamp,value\n/Drive/Vel,100,1.5\n/Drive/Vel,200,2.5\n"
+	if string(out) != want {
+		t.Errorf("expected %q, got %q", want, string(out))
+	}
+}
+
+func TestRunCommand_Range_Parquet_TypedValue(t *testing.T) {
+	serveFake(t, map[string]any{"/range": map[string]any{
+		"/Drive/Vel": []map[string]any{
+			{"timestamp": 100, "value": 1.5},
+			{"timestamp": 200, "value": 2.5},
+		},
+	}})
+	out, err := RunCommand([]string{"range", "/Drive/Vel", "--session", "abc", "--format", "parquet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := parquet.OpenFile(bytes.NewReader(out), int64(len(out)))
+	if err != nil {
+		t.Fatalf("output is not a valid parquet file: %v", err)
+	}
+	r := parquet.NewGenericReader[map[string]any](bytes.NewReader(out), f.Schema())
+	rows := make([]map[string]any, 2)
+	for i := range rows {
+		rows[i] = map[string]any{}
+	}
+	if n, err := r.Read(rows); n != 2 {
+		t.Fatalf("expected 2 rows, got %d (err=%v)", n, err)
+	}
+	// Single numeric key: value column keeps native double type.
+	if v, ok := rows[0]["value"].(float64); !ok || v != 1.5 {
+		t.Errorf("row 0 value: expected float64 1.5, got %#v", rows[0]["value"])
+	}
+	if v, ok := rows[0]["key"].(string); !ok || v != "/Drive/Vel" {
+		t.Errorf("row 0 key: expected string /Drive/Vel, got %#v", rows[0]["key"])
+	}
+}

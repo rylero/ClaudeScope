@@ -52,7 +52,7 @@ func (s *ntSession) pump(sub *nt4.Subscription) {
 		s.fieldMeta[key] = update.Topic.Type
 		s.history[key] = append(s.history[key], DataPoint{
 			Timestamp: update.Timestamp,
-			Value:     update.Value,
+			Value:     decodeNTValue(update.Topic.Type, update.Value),
 		})
 		s.mu.Unlock()
 	}
@@ -224,6 +224,18 @@ func (s *ntSession) Close() error {
 	}
 	s.client.Disconnect()
 	return nil
+}
+
+// decodeNTValue decodes a known WPILib struct topic (delivered by NT4 as raw
+// packed bytes) into a named-field map, matching the log path. Non-struct
+// topics and unknown/mismatched struct payloads pass through unchanged.
+func decodeNTValue(typeStr string, v any) any {
+	if raw, ok := v.([]byte); ok {
+		if decoded, ok := DecodeStruct(typeStr, raw); ok {
+			return decoded
+		}
+	}
+	return v
 }
 
 func inferNTType(v any) string {
