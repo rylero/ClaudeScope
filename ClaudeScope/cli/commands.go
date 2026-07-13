@@ -208,15 +208,62 @@ func runGet(args []string) ([]byte, error) {
 func runRange(args []string) ([]byte, error) {
 	pos, flags := parseFlags(args)
 	if len(pos) < 1 {
-		return nil, fmt.Errorf("usage: range <key> [key2 ...] --session <id> [--start <us>] [--end <us>]")
+		return nil, fmt.Errorf("usage: range <key> [key2 ...] --session <id> [--start <us>] [--end <us>] [--format json|csv|parquet]")
 	}
 	id := flags["session"]
-	return DoRequest(http.MethodPost, "/range", map[string]any{
+	data, err := DoRequest(http.MethodPost, "/range", map[string]any{
 		"session_id": id,
 		"keys":       pos,
 		"start":      flagInt64(flags, "start", 0),
 		"end":        flagInt64(flags, "end", 0),
 	})
+	if err != nil {
+		return nil, err
+	}
+	return applyRangeFormat(data, flags)
+}
+
+// applyRangeFormat rewrites a /range response ({"<key>":[{timestamp,value},...]})
+// as CSV or Parquet when --format requests it. The nested per-key shape is
+// flattened to long-format rows {key, timestamp, value} sorted by (key,
+// timestamp) so it drops straight into pandas.read_csv/read_parquet and pivots
+// cleanly. For a single numeric key the `value` column keeps its native
+// (double/bool) parquet type; across keys of differing types it falls back to
+// a stringified column, same rule the query formatter uses.
+func applyRangeFormat(data []byte, flags map[string]string) ([]byte, error) {
+	format := flags["format"]
+	if format == "" || format == "json" {
+		return data, nil
+	}
+	if format != "csv" && format != "parquet" {
+		return nil, fmt.Errorf("unsupported --format %q (use json, csv, or parquet)", format)
+	}
+	var byKey map[string][]struct {
+		Timestamp int64 `json:"timestamp"`
+		Value     any   `json:"value"`
+	}
+	if err := json.Unmarshal(data, &byKey); err != nil {
+		return nil, fmt.Errorf("--format %s requires a range result: %w", format, err)
+	}
+	keys := make([]string, 0, len(byKey))
+	for k := range byKey {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var rows []map[string]any
+	for _, k := range keys {
+		for _, p := range byKey[k] {
+			rows = append(rows, map[string]any{
+				"key":       k,
+				"timestamp": float64(p.Timestamp),
+				"value":     p.Value,
+			})
+		}
+	}
+	if format == "parquet" {
+		return rowsToParquet(rows)
+	}
+	return rowsToCSV(rows)
 }
 
 func runFindBool(args []string) ([]byte, error) {
@@ -367,6 +414,14 @@ func csvValue(v any) string {
 			return "True"
 		}
 		return "False"
+	}
+	// Format float64 in fixed notation (not Go's %g, which flips to scientific
+	// for large magnitudes) so timestamps like 30046400 don't render as
+	// "3.00464e+07". strconv 'f'/-1 keeps the shortest exact representation:
+	// integral values print without a decimal point (100 not 100.0), fractional
+	// values keep their significant digits (12.1 stays 12.1).
+	if f, ok := v.(float64); ok {
+		return strconv.FormatFloat(f, 'f', -1, 64)
 	}
 	return fmt.Sprintf("%v", v)
 }
@@ -664,7 +719,10 @@ func runHelp() ([]byte, error) {
 			"Global flag: append --out <file> to any command to write its output to a file instead of stdout.",
 			"query --follow true ignores --out and --format: it streams NDJSON (one JSON object per line) directly to stdout and runs until killed, rather than returning once.",
 			"query and query-multi (--union true) accept --format csv|parquet to emit CSV or Parquet instead of JSON, for direct pandas.read_csv()/read_parquet() consumption. Header/column order is alphabetical with Timestamp pinned first. Parquet preserves native bool/float64/string types and nulls; CSV stringifies everything (booleans as \"True\"/\"False\" so pandas infers bool dtype).",
-			"Workflow: load → query (--session optional) → disconnect when done.",
+			"range also accepts --format csv|parquet (long-format {key,timestamp,value} rows) — the preferred way to pull raw series into Python.",
+			"WPILib struct fields (struct:Pose2d, struct:ChassisSpeeds, struct:SwerveModuleState[], Rotation2d/3d, Translation2d/3d, Pose3d, Transform2d/3d, Twist2d/3d, SwerveModulePosition, Quaternion) decode automatically to named-field objects (e.g. {\"x\":..,\"y\":..,\"theta\":..}) in get/range instead of a raw base64 blob.",
+			"DIRECTION: the SPL *transform* stages (eval, where, timechart, rex, stats-by) are FROZEN — correct where data is present but not receiving further investment. For eval/filter/stats/resample work, prefer pulling raw series with `range --format parquet` and transforming in pandas (correct null handling, no per-response token cost). The SPL *access/correlation* features (multi-field forward-fill join, transaction, ranges) and the dedicated verbs (get/range/find-bool/find-threshold/stats/set) remain first-class.",
+			"Workflow: load → range --format parquet → pandas (or query for correlation-specific pipes) → disconnect when done.",
 		},
 		Commands: []cmd{
 			{
@@ -725,15 +783,16 @@ func runHelp() ([]byte, error) {
 			},
 			{
 				Name:  "range",
-				Desc:  "Get all data points for key(s) between start and end.",
-				Usage: "ClaudeScope range <key> [key2 ...] --session <id> [--start <us>] [--end <us>]",
+				Desc:  "Get all data points for key(s) between start and end. Add --format csv|parquet to get pandas-ready long-format rows (key,timestamp,value) instead of nested JSON — the recommended path for pulling raw series into Python for analysis.",
+				Usage: "ClaudeScope range <key> [key2 ...] --session <id> [--start <us>] [--end <us>] [--format json|csv|parquet]",
 				Params: []param{
 					{Name: "keys", Type: "[]string", Required: true, Desc: "One or more field keys"},
 					{Name: "--session", Type: "string", Required: false, Desc: "Session ID; optional when exactly one session is active"},
 					{Name: "--start", Type: "int64", Required: false, Desc: "Start µs; 0=beginning; negative=offset from end"},
 					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log; negative=offset from end"},
+					{Name: "--format", Type: "string", Required: false, Desc: `"json" (default nested per-key), "csv", or "parquet". CSV/Parquet flatten to long-format rows {key,timestamp,value} sorted by (key,timestamp), ready for pandas.read_csv()/read_parquet() and df.pivot(index="timestamp",columns="key",values="value"). Parquet keeps native value types for a single numeric key.`},
 				},
-				Returns: `{"<key>":[{"timestamp":<us>,"value":<any>},...]}`,
+				Returns: `{"<key>":[{"timestamp":<us>,"value":<any>},...]}, or long-format {key,timestamp,value} rows as CSV/Parquet bytes with --format`,
 			},
 			{
 				Name:  "find-bool",

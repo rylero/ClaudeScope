@@ -173,6 +173,13 @@ func decodeValue(typeStr string, payload []byte) (any, error) {
 	case "string":
 		return string(payload), nil
 	default:
+		// WPILib struct types ("struct:Pose2d", "struct:SwerveModuleState[]",
+		// ...) pack fixed little-endian float64s; decode the known ones into
+		// named-field maps so telemetry reads as {x,y,theta} rather than an
+		// opaque base64 blob. Unknown/mismatched payloads keep the raw bytes.
+		if decoded, ok := DecodeStruct(typeStr, payload); ok {
+			return decoded, nil
+		}
 		return payload, nil
 	}
 }
