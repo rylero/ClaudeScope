@@ -48,8 +48,7 @@ class Session:
         """Raw {key: [{timestamp, value}, ...]} data points between start and end.
 
         For analysis prefer `range_df`, which pulls the same data as Parquet and
-        returns a tidy DataFrame ready for pandas — pushing raw series into
-        pandas is the recommended path over composing multi-stage SPL transforms.
+        returns a tidy DataFrame ready for pandas.
         """
         args = ["range", *keys] + self._session_flags(start=start, end=end)
         return _cli.invoke(args)
@@ -65,7 +64,7 @@ class Session:
 
         This is the "cs -> parquet -> pandas" path: pull the raw series once and
         do eval/filter/correlate/resample in pandas, which handles nulls and
-        formatting correctly and costs no extra query-language surface.
+        formatting correctly.
         """
         args = ["range", *keys, "--format", "parquet"] + self._session_flags(start=start, end=end)
         raw = _cli.invoke_bytes(args)
@@ -94,27 +93,6 @@ class Session:
         """Descriptive statistics (mean, median, min, max, quartiles, deltas) for a numeric field."""
         args = ["stats", key] + self._session_flags(start=start, end=end)
         return _cli.invoke(args)
-
-    def query(self, spl: str, start: int = 0, end: int = 0) -> pd.DataFrame:
-        """Run an SPL-subset pipe query and return the result rows as a DataFrame.
-
-        Fetched as Parquet rather than JSON: faster to transfer/parse for
-        large results and preserves column dtypes (bool/float/string) instead
-        of going through pandas' JSON type inference.
-
-        Prefer this only for the SPL access/correlation you can't trivially do
-        in pandas (e.g. `transaction`, `ranges`, cross-field forward-fill joins).
-        For eval/filter/stats/resample transforms, pulling raw series with
-        `range_df` and transforming in pandas is the recommended path — pandas
-        handles nulls and numeric formatting correctly and the SPL *transform*
-        stages are frozen (not receiving further investment); see
-        USABILITY_FRICTION.md.
-        """
-        args = ["query", spl, "--format", "parquet"] + self._session_flags(start=start, end=end)
-        raw = _cli.invoke_bytes(args)
-        if not raw:
-            return pd.DataFrame()
-        return pd.read_parquet(io.BytesIO(raw))
 
     def set(self, **pairs: Any) -> None:
         """Publish key/value pairs to a live NT session. Fails on log sessions."""

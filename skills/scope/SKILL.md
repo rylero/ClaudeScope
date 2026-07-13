@@ -78,7 +78,7 @@ Returns: `{"fields":[...],"start":<µs>,"end":<µs>}`
 ```bash
 ClaudeScope search-fields voltage --session <id>
 ```
-Case-insensitive substring match over the same field list `info` returns — useful before writing a query against a log with hundreds of NT keys instead of scrolling through the full `info` output. Returns: `{"fields":[{"key":"...","type":"..."},...]}`
+Case-insensitive substring match over the same field list `info` returns — useful for finding the right key in a log with hundreds of NT keys instead of scrolling through the full `info` output. Returns: `{"fields":[{"key":"...","type":"..."},...]}`
 
 ### Get value at timestamp (time=0 → latest)
 ```bash
@@ -91,6 +91,8 @@ Returns: `{"/key":{"timestamp":<µs>,"value":<any>}}`
 MSYS_NO_PATHCONV=1 ClaudeScope range /RealOutputs/Drive/LeftVelocity --session <id> --start 1000000 --end 5000000
 ```
 Returns: `{"/key":[{"timestamp":<µs>,"value":<any>},...]}`
+
+Add `--format csv` or `--format parquet` (default JSON) to get pandas-ready long-format `{key,timestamp,value}` rows across one or more keys — the recommended way to pull raw series into Python. See **Analyze in pandas** below.
 
 ### Find bool ranges (e.g. when robot was enabled)
 ```bash
@@ -117,89 +119,25 @@ MSYS_NO_PATHCONV=1 ClaudeScope stats /RealOutputs/Drive/LeftVelocity --session <
 ```
 Returns: `{"mean":<f>,"median":<f>,"min":<f>,"max":<f>,"q1":<f>,"q3":<f>,"avg_delta":<f/s>,"min_delta":<f/s>,"max_delta":<f/s>}`
 
-### Query (pipe language — a subset of Splunk SPL)
+### Analyze in pandas (cs → parquet → pandas)
 
-`query` runs a pipe query that joins multiple fields onto one forward-filled timestamp axis — use it for **correlated, multi-field** questions that the single-field verbs above can't express (e.g. "when were *both* currents above 40 at the same time").
-
-**It is a strict subset of Splunk SPL — write standard SPL and it works.** Do not learn a new syntax; just stay inside the supported set below.
+For anything beyond the single-field verbs above — correlating multiple fields, computed columns, filtering, resampling, per-group stats — pull the raw series with `range --format parquet` and do the transform in pandas, which handles nulls and formatting correctly for free.
 
 ```bash
-MSYS_NO_PATHCONV=1 ClaudeScope query "where CurrentA > 40 and CurrentB > 40 | stats avg(BatteryVoltage) by Subsystem" --session <id>
-```
-
-| Command | Notes |
-|---|---|
-| `where <expr>` (alias `search`) | `> < >= <= == != and or NOT`; `=` also accepted for equality |
-| `eval <name> = <expr>` | computed column; `+ - * /`, parens, functions `abs round sqrt ceil floor min max pow`. **Put spaces around operators** (`a - b`, not `a-b`) — field names may contain `-`/`/`. |
-| `rex field=<field> "<regex>"` | extract named groups from a string field into new columns; use `(?<name>...)` (SPL/PCRE syntax, auto-translated to Go's `(?P<name>...)`) |
-| `stats <agg>(<field>) [as <alias>] [by <field>...]` | aggs: `avg min max sum count median stdev p50 p90 p99` |
-| `timechart span=<duration> <agg>(<field>)... [by <field>]` | buckets rows into fixed time spans, applying the same aggs as `stats` per bucket. Span units: `us ms s m h d` (e.g. `span=500ms`, `span=1m`). |
-| `lookup "<path>.csv" <field> output <col> [as <alias>][, ...]` | left-joins a static CSV onto rows by equality on `<field>` (the CSV needs a header row with a same-named column); unmatched rows get `nil`. Simplified from real SPL's `lookup` (no named lookup-table registration). |
-| `table <field>...` (alias `fields`) | comma **or** space separated; `_time` = the Timestamp column |
-| `sort [-]<field>` | `-` prefix = descending |
-| `head N` / `tail N` | first/last N rows |
-| `ranges` | **ClaudeScope extension, not SPL.** Must be the last stage. Collapses matching rows into `[{start,end}]` intervals — the multi-field version of `find-bool`/`find-threshold`. |
-| `transaction start=<expr> end=<expr>` | **ClaudeScope extension, not SPL** (real SPL `transaction` has different, field-correlation semantics). Groups rows into episodes bounded by the two predicates, stamping a `transactionID` column; rows outside any episode are dropped. Pair with `stats ... by transactionID`. |
-
-**Macros:** wrap a name in backticks — `` `name` `` — to expand it from `~/.claudescope/macros.json`, a flat JSON object mapping macro name to the pipe-query text it stands for (e.g. `{"brownout": "where BatteryVoltage < 7 | ranges"}`). Macros can reference other macros; a missing file just means no macros are defined.
-
-**Not supported (returns an error):** `dedup`, subsearches, `join`.
-
-Returns: `{"result":[{"Timestamp":<µs>,"<field>":<value>,...},...]}`, or `{"result":[{"start":<µs>,"end":<µs>},...]}` when the pipeline ends in `ranges`.
-
-Examples:
-```bash
-# intervals where battery sagged below 7V (multi-field capable, unlike find-threshold)
-MSYS_NO_PATHCONV=1 ClaudeScope query "where BatteryVoltage < 7 | ranges" --session <id>
-# top 10 highest current samples
-MSYS_NO_PATHCONV=1 ClaudeScope query "table _time CurrentA | sort -CurrentA | head 10" --session <id>
-# computed column, then filter on it
-MSYS_NO_PATHCONV=1 ClaudeScope query "eval imbalance = abs(CurrentA - CurrentB) | where imbalance > 15 | ranges" --session <id>
-# extract channel numbers from driver-station messages and count them
-MSYS_NO_PATHCONV=1 ClaudeScope query 'rex field=/DriverStation/Message "channel (?<ch>\d+)" | stats count by ch' --session <id>
-# average current draw per 500ms bucket, split by subsystem
-MSYS_NO_PATHCONV=1 ClaudeScope query "timechart span=500ms avg(CurrentA) by Subsystem" --session <id>
-# average battery voltage during each autonomous-enabled episode
-MSYS_NO_PATHCONV=1 ClaudeScope query "transaction start=(AutonomousEnabled == true) end=(AutonomousEnabled == false) | stats avg(BatteryVoltage) by transactionID" --session <id>
-# join CAN IDs to human-readable subsystem names via a lookup CSV
-MSYS_NO_PATHCONV=1 ClaudeScope query 'lookup "canids.csv" CANID output SubsystemName as Subsystem | stats count by Subsystem' --session <id>
-# reuse a saved query (define "brownout" once in ~/.claudescope/macros.json)
-MSYS_NO_PATHCONV=1 ClaudeScope query '`brownout`' --session <id>
-```
-
-**Output format:** `query` and `query-multi --union true` accept `--format csv` or `--format parquet` (default is JSON) so results can be loaded straight into `pandas` without hand-parsing:
-```bash
-MSYS_NO_PATHCONV=1 ClaudeScope query "stats avg(BatteryVoltage) by Subsystem" --session <id> --format parquet --out result.parquet
+# pull one or more series as long-format {key,timestamp,value} rows
+MSYS_NO_PATHCONV=1 ClaudeScope range CurrentA CurrentB BatteryVoltage --session <id> --format parquet --out series.parquet
 ```
 ```python
 import pandas as pd
-df = pd.read_parquet("result.parquet")  # or pd.read_csv("result.csv") for --format csv
+df = pd.read_parquet("series.parquet")           # columns: key, timestamp, value
+wide = df.pivot(index="timestamp", columns="key", values="value").ffill()
+# now correlate/eval/filter/resample in pandas, e.g.:
+both_high = wide[(wide["CurrentA"] > 40) & (wide["CurrentB"] > 40)]
+per_bucket = wide["CurrentA"].groupby(wide.index // 500_000).mean()  # 500ms buckets
 ```
-Parquet preserves native bool/float64/string types and true nulls for missing columns (e.g. `stats ... by` output where different groups produce different aggregate columns); CSV must stringify everything, though booleans are written as `True`/`False` so `pandas.read_csv` still infers `bool` dtype. Prefer Parquet for large results or when a column mixes numeric and missing values. If you're working in Python, prefer the **Python client** below over `--format` — it builds a DataFrame directly and skips the file round-trip.
+`--format parquet` preserves native bool/float64/string types and true nulls; `--format csv` stringifies everything (booleans as `True`/`False` so `pandas.read_csv` still infers `bool` dtype). Prefer Parquet for large results. If you're working in Python, prefer the **Python client** below — `session.range_df(..., pivot=True)` builds the DataFrame directly and skips the file round-trip.
 
-**Live streaming:** add `--follow true` (only valid for a `connect`-ed live session, not a loaded log) to re-run the query on an interval against a live session and stream one NDJSON line to stdout per *changed* result, instead of returning once:
-```bash
-MSYS_NO_PATHCONV=1 ClaudeScope query "stats avg(BatteryVoltage)" --session <id> --follow true --interval-ms 500
-```
-This runs until killed (like `tail -f`) — don't invoke it from a context expecting a single bounded response; it's meant for a long-running consumer tailing stdout. `--follow` ignores `--start`/`--end` (always evaluates 0-to-now) and is incompatible with `--format` (streamed output is always NDJSON) and `--out`.
-
-### Query across multiple sessions
-
-`query-multi` runs the same query against several loaded sessions at once — e.g. every qualification match log from an event — instead of looping `query` manually. Load all the logs first (each `load` returns its own `session_id`; use `sessions` to list them).
-
-```bash
-# average auton battery sag across every currently loaded log
-MSYS_NO_PATHCONV=1 ClaudeScope query-multi "stats avg(BatteryVoltage), min(BatteryVoltage)" --all true
-# same, but only specific matches
-MSYS_NO_PATHCONV=1 ClaudeScope query-multi "stats avg(BatteryVoltage)" --sessions <id1>,<id2>,<id3>
-# flatten brownout intervals from every match into one session_id-tagged table
-MSYS_NO_PATHCONV=1 ClaudeScope query-multi "where BatteryVoltage < 7 | ranges" --all true --union true
-```
-
-- `--all true` or `--sessions id1,id2,...` — exactly one is required. Booleans must be spelled out (`--all true`, `--union true`) — bare `--all` is not recognized.
-- Default (comparison mode): `{"results":[{"session_id":"...","label":"...","result":...},...]}` — one entry per session, each session's own execution error (e.g. a field missing from that particular log) reported in that entry instead of failing the whole batch.
-- `--union true`: `{"result":[{"session_id":"...",...},...],"errors":[...]}` — successful rows flattened into one table tagged with `session_id`; errored sessions listed separately under `errors`, not silently dropped.
-- `--format csv`/`--format parquet` also work here, but only combined with `--union true` — comparison mode's per-session shape isn't row-shaped and errors out otherwise.
+WPILib struct fields (`struct:Pose2d`, `struct:ChassisSpeeds`, `struct:SwerveModuleState[]`, `Rotation2d/3d`, `Translation2d/3d`, `Pose3d`, `Transform2d/3d`, `Twist2d/3d`, `SwerveModulePosition`, `Quaternion`) decode automatically to named-field objects (e.g. `{"x":..,"y":..,"theta":..}`) in `get`/`range`.
 
 ### Set NT value (live sessions only)
 ```bash
@@ -221,16 +159,16 @@ ClaudeScope help
 
 ## Python client (`claudescope-py`)
 
-If the task is "run a query and hand it to pandas" in Python, prefer the `claudescope` package (`ClaudeScope/python/`) over shelling out to the CLI and parsing `--format csv`/`--format parquet` output yourself — it wraps the same CLI binary and returns a `pandas.DataFrame` directly:
+If the task is "pull telemetry and analyze it in pandas" in Python, prefer the `claudescope` package (`ClaudeScope/python/`) over shelling out to the CLI and parsing `--format csv`/`--format parquet` output yourself — it wraps the same CLI binary and returns a `pandas.DataFrame` directly:
 
 ```python
 import claudescope as scope
 
 with scope.load("/path/to/log.wpilog") as session:
-    df = session.query("stats avg(BatteryVoltage) by Subsystem")
+    df = session.range_df("CurrentA", "CurrentB", pivot=True)
 ```
 
-Covers `load`/`connect`/`sessions`/`disconnect`, `query`/`query_multi` (→ `DataFrame`, or `dict[session_id, DataFrame | ClaudeScopeError]` in comparison mode), and `get`/`range`/`find_bool`/`find_threshold`/`stats`/`set`. Requires the `ClaudeScope` binary on `PATH` (or `CLAUDESCOPE_BIN` set). Failures raise `claudescope.ClaudeScopeError` with `.code`, not a raw subprocess error. See `ClaudeScope/python/README.md` for the full API and design notes.
+Covers `load`/`connect`/`sessions`/`disconnect`, `range_df` (→ tidy/pivoted `DataFrame` via Parquet), and `get`/`range`/`find_bool`/`find_threshold`/`stats`/`set`. Requires the `ClaudeScope` binary on `PATH` (or `CLAUDESCOPE_BIN` set). Failures raise `claudescope.ClaudeScopeError` with `.code`, not a raw subprocess error. See `ClaudeScope/python/README.md` for the full API and design notes.
 
 ---
 
