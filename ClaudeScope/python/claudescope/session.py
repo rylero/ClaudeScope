@@ -45,9 +45,35 @@ class Session:
         return _cli.invoke(args)
 
     def range(self, *keys: str, start: int = 0, end: int = 0) -> dict:
-        """Raw {key: [{timestamp, value}, ...]} data points between start and end."""
+        """Raw {key: [{timestamp, value}, ...]} data points between start and end.
+
+        For analysis prefer `range_df`, which pulls the same data as Parquet and
+        returns a tidy DataFrame ready for pandas.
+        """
         args = ["range", *keys] + self._session_flags(start=start, end=end)
         return _cli.invoke(args)
+
+    def range_df(self, *keys: str, start: int = 0, end: int = 0, pivot: bool = False) -> pd.DataFrame:
+        """Time-series data for key(s) as a DataFrame, fetched via Parquet.
+
+        Returns long-format rows with columns ``key``, ``timestamp`` (µs), and
+        ``value`` (native dtype for a single numeric key; stringified across
+        mixed-type keys). Pass ``pivot=True`` to get a wide frame indexed by
+        ``timestamp`` with one column per key (forward-fill yourself if you need
+        a shared axis: ``df.ffill()``).
+
+        This is the "cs -> parquet -> pandas" path: pull the raw series once and
+        do eval/filter/correlate/resample in pandas, which handles nulls and
+        formatting correctly.
+        """
+        args = ["range", *keys, "--format", "parquet"] + self._session_flags(start=start, end=end)
+        raw = _cli.invoke_bytes(args)
+        if not raw:
+            return pd.DataFrame(columns=["key", "timestamp", "value"])
+        df = pd.read_parquet(io.BytesIO(raw))
+        if pivot and not df.empty:
+            return df.pivot(index="timestamp", columns="key", values="value").sort_index()
+        return df
 
     def find_bool(self, key: str, value: bool) -> pd.DataFrame:
         """Time ranges (as a start/end DataFrame) where `key` equals `value`."""
@@ -67,19 +93,6 @@ class Session:
         """Descriptive statistics (mean, median, min, max, quartiles, deltas) for a numeric field."""
         args = ["stats", key] + self._session_flags(start=start, end=end)
         return _cli.invoke(args)
-
-    def query(self, spl: str, start: int = 0, end: int = 0) -> pd.DataFrame:
-        """Run an SPL-subset pipe query and return the result rows as a DataFrame.
-
-        Fetched as Parquet rather than JSON: faster to transfer/parse for
-        large results and preserves column dtypes (bool/float/string) instead
-        of going through pandas' JSON type inference.
-        """
-        args = ["query", spl, "--format", "parquet"] + self._session_flags(start=start, end=end)
-        raw = _cli.invoke_bytes(args)
-        if not raw:
-            return pd.DataFrame()
-        return pd.read_parquet(io.BytesIO(raw))
 
     def set(self, **pairs: Any) -> None:
         """Publish key/value pairs to a live NT session. Fails on log sessions."""

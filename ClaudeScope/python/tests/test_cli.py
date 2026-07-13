@@ -58,11 +58,11 @@ def test_invoke_bytes_returns_raw_stdout(monkeypatch):
     raw = b"\x50\x41\x52\x31fake-parquet-bytes"
 
     def fake_run(cmd, capture_output):
-        assert cmd == ["ClaudeScope", "query", "table Timestamp", "--format", "parquet"]
+        assert cmd == ["ClaudeScope", "range", "/Drive/Vel", "--format", "parquet"]
         return FakeProc(stdout=raw, returncode=0)
 
     monkeypatch.setattr(_cli.subprocess, "run", fake_run)
-    assert _cli.invoke_bytes(["query", "table Timestamp", "--format", "parquet"]) == raw
+    assert _cli.invoke_bytes(["range", "/Drive/Vel", "--format", "parquet"]) == raw
 
 
 def test_invoke_bytes_raises_on_cli_error_payload(monkeypatch):
@@ -74,7 +74,7 @@ def test_invoke_bytes_raises_on_cli_error_payload(monkeypatch):
 
     monkeypatch.setattr(_cli.subprocess, "run", fake_run)
     with pytest.raises(ClaudeScopeError) as exc:
-        _cli.invoke_bytes(["query", "table Timestamp", "--format", "parquet", "--session", "abc"])
+        _cli.invoke_bytes(["range", "/Drive/Vel", "--format", "parquet", "--session", "abc"])
     assert exc.value.code == "SESSION_NOT_FOUND"
     assert "session not found" in str(exc.value)
 
@@ -87,6 +87,6 @@ def test_invoke_raises_on_nonjson_failure(monkeypatch):
 
     monkeypatch.setattr(_cli.subprocess, "run", fake_run)
     with pytest.raises(ClaudeScopeError) as exc:
-        _cli.invoke(["query", "bad"])
+        _cli.invoke(["range", "bad"])
     assert exc.value.code == "COMMAND_FAILED"
     assert "segfault" in str(exc.value)

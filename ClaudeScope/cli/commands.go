@@ -7,11 +7,9 @@ import (
 	"fmt"
 	"math"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/parquet-go/parquet-go"
 )
@@ -20,8 +18,8 @@ import (
 var Version = "dev"
 
 // marshalJSON encodes v without HTML-escaping < > & so field names/values
-// containing those characters (e.g. an SPL comparison operator quoted back
-// in an error) round-trip unmangled instead of becoming <-style escapes.
+// containing those characters (e.g. a comparison operator quoted back in an
+// error) round-trip unmangled instead of becoming <-style escapes.
 func marshalJSON(v any, indent string) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -63,10 +61,6 @@ func RunCommand(args []string) ([]byte, error) {
 		return runFindThreshold(args[1:])
 	case "stats":
 		return runStats(args[1:])
-	case "query":
-		return runQuery(args[1:])
-	case "query-multi":
-		return runQueryMulti(args[1:])
 	case "set":
 		return runSet(args[1:])
 	case "help":
@@ -208,15 +202,62 @@ func runGet(args []string) ([]byte, error) {
 func runRange(args []string) ([]byte, error) {
 	pos, flags := parseFlags(args)
 	if len(pos) < 1 {
-		return nil, fmt.Errorf("usage: range <key> [key2 ...] --session <id> [--start <us>] [--end <us>]")
+		return nil, fmt.Errorf("usage: range <key> [key2 ...] --session <id> [--start <us>] [--end <us>] [--format json|csv|parquet]")
 	}
 	id := flags["session"]
-	return DoRequest(http.MethodPost, "/range", map[string]any{
+	data, err := DoRequest(http.MethodPost, "/range", map[string]any{
 		"session_id": id,
 		"keys":       pos,
 		"start":      flagInt64(flags, "start", 0),
 		"end":        flagInt64(flags, "end", 0),
 	})
+	if err != nil {
+		return nil, err
+	}
+	return applyRangeFormat(data, flags)
+}
+
+// applyRangeFormat rewrites a /range response ({"<key>":[{timestamp,value},...]})
+// as CSV or Parquet when --format requests it. The nested per-key shape is
+// flattened to long-format rows {key, timestamp, value} sorted by (key,
+// timestamp) so it drops straight into pandas.read_csv/read_parquet and pivots
+// cleanly. For a single numeric key the `value` column keeps its native
+// (double/bool) parquet type; across keys of differing types it falls back to
+// a stringified column.
+func applyRangeFormat(data []byte, flags map[string]string) ([]byte, error) {
+	format := flags["format"]
+	if format == "" || format == "json" {
+		return data, nil
+	}
+	if format != "csv" && format != "parquet" {
+		return nil, fmt.Errorf("unsupported --format %q (use json, csv, or parquet)", format)
+	}
+	var byKey map[string][]struct {
+		Timestamp int64 `json:"timestamp"`
+		Value     any   `json:"value"`
+	}
+	if err := json.Unmarshal(data, &byKey); err != nil {
+		return nil, fmt.Errorf("--format %s requires a range result: %w", format, err)
+	}
+	keys := make([]string, 0, len(byKey))
+	for k := range byKey {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var rows []map[string]any
+	for _, k := range keys {
+		for _, p := range byKey[k] {
+			rows = append(rows, map[string]any{
+				"key":       k,
+				"timestamp": float64(p.Timestamp),
+				"value":     p.Value,
+			})
+		}
+	}
+	if format == "parquet" {
+		return rowsToParquet(rows)
+	}
+	return rowsToCSV(rows)
 }
 
 func runFindBool(args []string) ([]byte, error) {
@@ -280,58 +321,6 @@ func runStats(args []string) ([]byte, error) {
 	})
 }
 
-func runQuery(args []string) ([]byte, error) {
-	pos, flags := parseFlags(args)
-	if len(pos) < 1 {
-		return nil, fmt.Errorf(`usage: query "<pipe string>" --session <id> [--start <us>] [--end <us>] [--follow true] [--interval-ms <n>] [--format json|csv|parquet]`)
-	}
-	id := flags["session"]
-	if flagBool(flags, "follow") {
-		if format := flags["format"]; format != "" && format != "json" {
-			return nil, fmt.Errorf("--format %s is not valid with --follow true (streamed output is always NDJSON)", format)
-		}
-		return nil, runQueryFollow(id, pos[0], flagInt64(flags, "interval-ms", 500))
-	}
-	data, err := DoRequest(http.MethodPost, "/query", map[string]any{
-		"session_id": id,
-		"query":      pos[0],
-		"start":      flagInt64(flags, "start", 0),
-		"end":        flagInt64(flags, "end", 0),
-	})
-	if err != nil {
-		return nil, err
-	}
-	return applyResultFormat(data, flags)
-}
-
-// applyResultFormat rewrites a {"result": [...]} response as CSV or Parquet
-// when --format requests it. Only row-shaped results (array of objects, as
-// produced by query/query-multi --union) can be converted; ranges output
-// ({"start","end"} pairs) also qualifies since it's an array of objects.
-func applyResultFormat(data []byte, flags map[string]string) ([]byte, error) {
-	format := flags["format"]
-	if format == "" || format == "json" {
-		return data, nil
-	}
-	if format != "csv" && format != "parquet" {
-		return nil, fmt.Errorf("unsupported --format %q (use json, csv, or parquet)", format)
-	}
-	var wrapper struct {
-		Result []map[string]any `json:"result"`
-		Errors []map[string]any `json:"errors"`
-	}
-	if err := json.Unmarshal(data, &wrapper); err != nil {
-		return nil, fmt.Errorf("--format %s requires a row-shaped result: %w", format, err)
-	}
-	if len(wrapper.Errors) > 0 {
-		return nil, fmt.Errorf("%d session(s) failed during query-multi and --format %s cannot carry per-session errors alongside row data; rerun with --format json to see them", len(wrapper.Errors), format)
-	}
-	if format == "parquet" {
-		return rowsToParquet(wrapper.Result)
-	}
-	return rowsToCSV(wrapper.Result)
-}
-
 // resultColumns returns the union of keys across rows, sorted alphabetically
 // except "Timestamp", which is pinned first when present. Used to give both
 // the CSV and Parquet writers a stable column order over heterogeneous rows
@@ -368,6 +357,14 @@ func csvValue(v any) string {
 		}
 		return "False"
 	}
+	// Format float64 in fixed notation (not Go's %g, which flips to scientific
+	// for large magnitudes) so timestamps like 30046400 don't render as
+	// "3.00464e+07". strconv 'f'/-1 keeps the shortest exact representation:
+	// integral values print without a decimal point (100 not 100.0), fractional
+	// values keep their significant digits (12.1 stays 12.1).
+	if f, ok := v.(float64); ok {
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	}
 	return fmt.Sprintf("%v", v)
 }
 
@@ -399,90 +396,6 @@ func rowsToCSV(rows []map[string]any) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
-}
-
-// runQueryFollow re-runs the query against the full live range on an
-// interval, printing one NDJSON line to stdout per changed result so a
-// long-running consumer (e.g. a Python dashboard) can tail stdout instead of
-// re-polling the daemon itself. It re-evaluates the whole pipeline each tick
-// rather than incrementally, so stats/timechart aggregations stay correct
-// over the growing window; it only writes a line when the result actually
-// changed, to avoid spamming an idle stream. It never returns except on
-// error (e.g. daemon lost, session disconnected) — the process is expected
-// to run until the caller kills it, like `tail -f`.
-func runQueryFollow(sessionID, q string, intervalMs int64) error {
-	if intervalMs <= 0 {
-		intervalMs = 500
-	}
-	resolvedID, err := resolveLiveSessionID(sessionID)
-	if err != nil {
-		return err
-	}
-	var last []byte
-	for {
-		result, err := DoRequest(http.MethodPost, "/query", map[string]any{
-			"session_id": resolvedID,
-			"query":      q,
-			"start":      int64(0),
-			"end":        int64(0),
-		})
-		if err != nil {
-			return err
-		}
-		// The daemon's JSON encoder already appends a trailing newline; trim
-		// it so each NDJSON line has exactly one, not a blank line between
-		// records (some strict line-based JSON readers choke on those).
-		result = bytes.TrimRight(result, "\n")
-		if !bytes.Equal(result, last) {
-			os.Stdout.Write(result)
-			os.Stdout.Write([]byte("\n"))
-			last = append(last[:0], result...)
-		}
-		time.Sleep(time.Duration(intervalMs) * time.Millisecond)
-	}
-}
-
-// resolveLiveSessionID mirrors the daemon's default-session resolution
-// (empty id => sole active session) and rejects log sessions, since
-// --follow only makes sense against a live NT session whose time range
-// keeps growing; a log session would just repeat the same result forever.
-func resolveLiveSessionID(id string) (string, error) {
-	data, err := DoRequest(http.MethodGet, "/sessions", nil)
-	if err != nil {
-		return "", err
-	}
-	var resp struct {
-		Sessions []struct {
-			ID   string `json:"id"`
-			Type string `json:"type"`
-		} `json:"sessions"`
-	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return "", fmt.Errorf("parse sessions response: %w", err)
-	}
-	if id == "" {
-		switch len(resp.Sessions) {
-		case 0:
-			return "", fmt.Errorf("no active session; run 'load <file>' or 'connect <ip>' first")
-		case 1:
-			id = resp.Sessions[0].ID
-		default:
-			ids := make([]string, len(resp.Sessions))
-			for i, s := range resp.Sessions {
-				ids[i] = s.ID
-			}
-			return "", fmt.Errorf("multiple active sessions (%s); specify --session <id>", strings.Join(ids, ", "))
-		}
-	}
-	for _, s := range resp.Sessions {
-		if s.ID == id {
-			if s.Type != "live" {
-				return "", fmt.Errorf("--follow requires a live session (got type %q); log sessions have a fixed end", s.Type)
-			}
-			return id, nil
-		}
-	}
-	return "", fmt.Errorf("session not found: %s", id)
 }
 
 // rowsToParquet renders rows as a Parquet file, preserving each column's
@@ -594,37 +507,6 @@ func rowsToParquet(rows []map[string]any) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func runQueryMulti(args []string) ([]byte, error) {
-	pos, flags := parseFlags(args)
-	if len(pos) < 1 {
-		return nil, fmt.Errorf(`usage: query-multi "<pipe string>" (--sessions id1,id2,... | --all true) [--union true] [--start <us>] [--end <us>] [--format json|csv|parquet]`)
-	}
-	all := flagBool(flags, "all")
-	var ids []string
-	if v, ok := flags["sessions"]; ok && v != "" {
-		ids = strings.Split(v, ",")
-	}
-	if !all && len(ids) == 0 {
-		return nil, fmt.Errorf("query-multi requires --sessions id1,id2,... or --all true")
-	}
-	union := flagBool(flags, "union")
-	if format := flags["format"]; (format == "csv" || format == "parquet") && !union {
-		return nil, fmt.Errorf("--format %s requires --union true (comparison mode isn't row-shaped)", format)
-	}
-	data, err := DoRequest(http.MethodPost, "/query-multi", map[string]any{
-		"session_ids": ids,
-		"all":         all,
-		"query":       pos[0],
-		"start":       flagInt64(flags, "start", 0),
-		"end":         flagInt64(flags, "end", 0),
-		"union":       union,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return applyResultFormat(data, flags)
-}
-
 func runVersion() ([]byte, error) {
 	return marshalJSON(map[string]string{"version": Version}, "")
 }
@@ -662,9 +544,9 @@ func runHelp() ([]byte, error) {
 			"On Git Bash/MSYS2, set MSYS_NO_PATHCONV=1 before keys that start with '/'.",
 			"--session is optional when exactly one session is active; it defaults to that session. With multiple sessions, an AMBIGUOUS_SESSION error lists the IDs.",
 			"Global flag: append --out <file> to any command to write its output to a file instead of stdout.",
-			"query --follow true ignores --out and --format: it streams NDJSON (one JSON object per line) directly to stdout and runs until killed, rather than returning once.",
-			"query and query-multi (--union true) accept --format csv|parquet to emit CSV or Parquet instead of JSON, for direct pandas.read_csv()/read_parquet() consumption. Header/column order is alphabetical with Timestamp pinned first. Parquet preserves native bool/float64/string types and nulls; CSV stringifies everything (booleans as \"True\"/\"False\" so pandas infers bool dtype).",
-			"Workflow: load → query (--session optional) → disconnect when done.",
+			"range accepts --format csv|parquet (long-format {key,timestamp,value} rows) — the preferred way to pull raw series into Python for analysis in pandas.",
+			"WPILib struct fields (struct:Pose2d, struct:ChassisSpeeds, struct:SwerveModuleState[], Rotation2d/3d, Translation2d/3d, Pose3d, Transform2d/3d, Twist2d/3d, SwerveModulePosition, Quaternion) decode automatically to named-field objects (e.g. {\"x\":..,\"y\":..,\"theta\":..}) in get/range instead of a raw base64 blob.",
+			"Workflow: load → range --format parquet → pandas → disconnect when done.",
 		},
 		Commands: []cmd{
 			{
@@ -704,7 +586,7 @@ func runHelp() ([]byte, error) {
 			},
 			{
 				Name:  "search-fields",
-				Desc:  "Case-insensitive substring search over a session's field list (filters the same data 'info' returns). Useful when writing SPL queries against a log with hundreds of NT keys.",
+				Desc:  "Case-insensitive substring search over a session's field list (filters the same data 'info' returns). Useful for finding the right key in a log with hundreds of NT keys.",
 				Usage: "ClaudeScope search-fields <substr> --session <id>",
 				Params: []param{
 					{Name: "substr", Type: "string", Required: true, Desc: "Substring to match against field keys, case-insensitive"},
@@ -725,15 +607,16 @@ func runHelp() ([]byte, error) {
 			},
 			{
 				Name:  "range",
-				Desc:  "Get all data points for key(s) between start and end.",
-				Usage: "ClaudeScope range <key> [key2 ...] --session <id> [--start <us>] [--end <us>]",
+				Desc:  "Get all data points for key(s) between start and end. Add --format csv|parquet to get pandas-ready long-format rows (key,timestamp,value) instead of nested JSON — the recommended path for pulling raw series into Python for analysis.",
+				Usage: "ClaudeScope range <key> [key2 ...] --session <id> [--start <us>] [--end <us>] [--format json|csv|parquet]",
 				Params: []param{
 					{Name: "keys", Type: "[]string", Required: true, Desc: "One or more field keys"},
 					{Name: "--session", Type: "string", Required: false, Desc: "Session ID; optional when exactly one session is active"},
 					{Name: "--start", Type: "int64", Required: false, Desc: "Start µs; 0=beginning; negative=offset from end"},
 					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log; negative=offset from end"},
+					{Name: "--format", Type: "string", Required: false, Desc: `"json" (default nested per-key), "csv", or "parquet". CSV/Parquet flatten to long-format rows {key,timestamp,value} sorted by (key,timestamp), ready for pandas.read_csv()/read_parquet() and df.pivot(index="timestamp",columns="key",values="value"). Parquet keeps native value types for a single numeric key.`},
 				},
-				Returns: `{"<key>":[{"timestamp":<us>,"value":<any>},...]}`,
+				Returns: `{"<key>":[{"timestamp":<us>,"value":<any>},...]}, or long-format {key,timestamp,value} rows as CSV/Parquet bytes with --format`,
 			},
 			{
 				Name:  "find-bool",
@@ -769,36 +652,6 @@ func runHelp() ([]byte, error) {
 					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log"},
 				},
 				Returns: `{"mean":<f>,"median":<f>,"min":<f>,"max":<f>,"q1":<f>,"q3":<f>,"avg_delta":<f/s>,"min_delta":<f/s>,"max_delta":<f/s>}`,
-			},
-			{
-				Name:  "query",
-				Desc:  "Run a pipe query joining multiple fields on a shared, forward-filled timestamp axis. This is a SUBSET OF SPLUNK SPL: write standard SPL and it works. Supported: where (alias: search), eval <name> = <expr>, rex field=<field> \"<regex>\", stats <agg>(<field>) [as <alias>] [by <field>...], timechart span=<duration> <agg>(<field>)... [by <field>], lookup \"<path>.csv\" <field> output <col> [as <alias>][, ...] (CSV must have a header row; joins on <field> against a same-named CSV column), table (alias: fields), sort [-]<field>, head N, tail N, and the ClaudeScope-only extensions 'ranges' (must be last; collapses matching rows into [{start,end}] intervals) and 'transaction start=<expr> end=<expr>' (groups rows into episodes bounded by the two predicates, stamping a transactionID column; rows outside any episode are dropped). Aggregates: avg,min,max,sum,count,median,stdev,p50,p90,p99. timechart span units: us,ms,s,m,h,d (e.g. span=500ms, span=1m). eval operators: + - * / and functions abs,round,sqrt,ceil,floor,min,max,pow (put spaces around operators). rex uses (?<name>...) named groups. Comparison ops: > < >= <= == (= also works) != and or NOT. '_time' aliases the Timestamp column. Backtick-quoted `name` references expand named macros from ~/.claudescope/macros.json (flat JSON: name -> pipe-query text). NOT SUPPORTED (errors): dedup, subsearches, join.",
-				Usage: `ClaudeScope query "<pipe string>" --session <id> [--start <us>] [--end <us>] [--follow true] [--interval-ms <n>] [--format json|csv|parquet]`,
-				Params: []param{
-					{Name: "query", Type: "string", Required: true, Desc: `SPL-subset pipe query, e.g. "where CurrentA > 40 and CurrentB > 40 | stats avg(BatteryVoltage) by Subsystem"`},
-					{Name: "--session", Type: "string", Required: false, Desc: "Session ID; optional when exactly one session is active"},
-					{Name: "--start", Type: "int64", Required: false, Desc: "Start µs; 0=beginning; negative=offset from end. Ignored when --follow true (always runs 0 to now)."},
-					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log; negative=offset from end. Ignored when --follow true."},
-					{Name: "--follow", Type: "bool", Required: false, Desc: "Must be spelled out (--follow true). Re-runs the query against a live session on an interval, printing one NDJSON line to stdout per changed result instead of returning once. Runs until killed; only valid for live (connect) sessions, not loaded logs. Incompatible with --format (NDJSON only)."},
-					{Name: "--interval-ms", Type: "int64", Required: false, Desc: "Poll interval in milliseconds when --follow true. Default 500."},
-					{Name: "--format", Type: "string", Required: false, Desc: `"json" (default), "csv", or "parquet". CSV is a plain header+rows table, ready for pandas.read_csv(). Parquet preserves native types/nulls, ready for pandas.read_parquet(). Not valid with --follow true.`},
-				},
-				Returns: `{"result":[{"Timestamp":<us>,"<field>":<value>,...},...]} or {"result":[{"start":<us>,"end":<us>},...]} when the pipeline ends in 'ranges'. With --follow true, one such JSON object per line (NDJSON) on stdout instead of a single response. With --format csv/parquet, a CSV/Parquet byte stream instead of JSON.`,
-			},
-			{
-				Name:  "query-multi",
-				Desc:  "Run the same query across several sessions at once (e.g. every match log from an event) and either compare or merge the results. Parses the query once, so one typo doesn't repeat N times; each session's own execution error (e.g. a field missing from that particular log) is reported per-session instead of aborting the whole batch. Comparison mode (default) returns one entry per session_id. Union mode (--union true) flattens every session's successful rows into one table tagged with a 'session_id' column (or 'session_id'/'start'/'end' rows if the query ends in 'ranges'); errored sessions are reported separately under 'errors' rather than silently dropped.",
-				Usage: `ClaudeScope query-multi "<pipe string>" (--sessions id1,id2,... | --all true) [--union true] [--start <us>] [--end <us>] [--format json|csv|parquet]`,
-				Params: []param{
-					{Name: "query", Type: "string", Required: true, Desc: "SPL-subset pipe query, same grammar as `query`"},
-					{Name: "--sessions", Type: "string", Required: false, Desc: "Comma-separated session IDs; required unless --all true"},
-					{Name: "--all", Type: "bool", Required: false, Desc: "Run against every currently active session instead of --sessions. Must be spelled out (--all true), not bare --all."},
-					{Name: "--union", Type: "bool", Required: false, Desc: "Flatten successful results into one session_id-tagged table instead of one entry per session. Must be spelled out (--union true)."},
-					{Name: "--start", Type: "int64", Required: false, Desc: "Start µs; 0=beginning; negative=offset from end"},
-					{Name: "--end", Type: "int64", Required: false, Desc: "End µs; 0=end of log; negative=offset from end"},
-					{Name: "--format", Type: "string", Required: false, Desc: `"json" (default), "csv", or "parquet". Both require --union true (comparison mode isn't row-shaped).`},
-				},
-				Returns: `{"results":[{"session_id":"...","label":"...","result":...},...]} (comparison mode) or {"result":[{"session_id":"...",...},...],"errors":[...]} (union mode); with --format csv/parquet and --union true, a CSV/Parquet byte stream of the result rows instead of JSON`,
 			},
 			{
 				Name:  "set",

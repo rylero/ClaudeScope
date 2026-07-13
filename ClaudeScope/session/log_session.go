@@ -173,6 +173,13 @@ func decodeValue(typeStr string, payload []byte) (any, error) {
 	case "string":
 		return string(payload), nil
 	default:
+		// WPILib struct types ("struct:Pose2d", "struct:SwerveModuleState[]",
+		// ...) pack fixed little-endian float64s; decode the known ones into
+		// named-field maps so telemetry reads as {x,y,theta} rather than an
+		// opaque base64 blob. Unknown/mismatched payloads keep the raw bytes.
+		if decoded, ok := DecodeStruct(typeStr, payload); ok {
+			return decoded, nil
+		}
 		return payload, nil
 	}
 }
@@ -346,8 +353,7 @@ func (s *wpilogSession) FindThresholdRanges(key string, min, max float64) ([]Tim
 // FindRuns collapses pts into contiguous [start,end) intervals where pred(value)
 // matches. Points pred deems inapplicable (wrong type for the field) are
 // skipped without affecting an open run. A run still open at the last point
-// is closed at logEnd. Shared by FindBoolRanges, FindThresholdRanges, and the
-// query package's `ranges` stage.
+// is closed at logEnd. Shared by FindBoolRanges and FindThresholdRanges.
 func FindRuns(pts []DataPoint, logEnd int64, pred func(any) (matches, applicable bool)) []TimeRange {
 	var ranges []TimeRange
 	inRange := false
@@ -485,10 +491,9 @@ func ToFloat64(v any) (float64, error) {
 	case int:
 		return float64(val), nil
 	case string:
-		// lookup-joined CSV columns (and any other string-typed field) are
-		// always strings even when their contents are numeric, so coerce
-		// rather than reject — matches how Splunk treats extracted string
-		// fields in eval/stats.
+		// string-typed fields whose contents are numeric are coerced rather
+		// than rejected, so a value logged as a string still works in numeric
+		// comparisons (e.g. find-threshold).
 		if f, err := strconv.ParseFloat(val, 64); err == nil {
 			return f, nil
 		}
