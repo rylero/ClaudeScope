@@ -262,3 +262,33 @@ func TestLogSession_Set_ReturnsError(t *testing.T) {
 		t.Fatal("expected error: log sessions are read-only")
 	}
 }
+
+// Worlds / AdvantageKit logs sometimes include empty control records (entry
+// ID 0, zero-length payload). Those must be skipped, not fail the whole file.
+func TestParseWPILog_SkipsEmptyControlPayload(t *testing.T) {
+	base := makeTestLog()
+
+	var buf bytes.Buffer
+	buf.Write(base[:12]) // magic(6) + version(2) + extraLen(4) = header with empty extra
+
+	// Empty control record: tag 0x34, id=0, payload_size=0, timestamp=0
+	buf.WriteByte(0x34)
+	buf.WriteByte(0) // entry id
+	buf.Write([]byte{0, 0}) // payload size
+	buf.Write([]byte{0, 0, 0, 0}) // timestamp
+	// no payload bytes
+
+	buf.Write(base[12:]) // rest of valid records
+
+	s, err := ParseWPILog(buf.Bytes())
+	if err != nil {
+		t.Fatalf("ParseWPILog failed on log with empty control: %v", err)
+	}
+	fields, err := s.Fields()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) < 2 {
+		t.Fatalf("expected fields after empty control skip, got %d", len(fields))
+	}
+}

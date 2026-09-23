@@ -108,8 +108,11 @@ func readUintLE(r *bytes.Reader, n int) uint64 {
 }
 
 func (s *wpilogSession) applyControl(payload []byte) error {
+	// AdvantageKit / Rio logs sometimes emit empty control records.
+	// AdvantageScope skips them; aborting the whole file made most Worlds
+	// wpilogs unloadable (INVALID_LOG) despite being valid elsewhere.
 	if len(payload) < 1 {
-		return errors.New("empty control payload")
+		return nil
 	}
 	r := bytes.NewReader(payload[1:])
 	switch payload[0] {
